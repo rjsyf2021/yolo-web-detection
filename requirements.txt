@@ -1,0 +1,9 @@
+# Application extras only. Install in an existing compatible GPU environment.
+# torch, torchvision, ultralytics and TensorRT must already match your engine.
+fastapi>=0.115
+uvicorn[standard]
+python-multipart
+numpy
+opencv-python
+av>=14
+imageio-ffmpeg
