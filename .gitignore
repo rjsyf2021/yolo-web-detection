@@ -25,3 +25,27 @@ mediamtx
 mediamtx.exe
 .DS_Store
 Thumbs.db
+
+# --- 本机产物与本地文件（2026-10-04 补充）---
+
+# Gradio 自动生成的本地证书/缓存
+.gradio/
+
+# 会话/临时产物
+*.ses
+
+# 生成的基准测试报告
+full-report.json
+full-1080-report.json
+video-benchmark.json
+
+# 写有本机绝对路径的启动脚本；部署时按 docs/PUBLISH.md 自行创建
+start.sh
+
+# 本机备用实现与基准脚本。如需公开：删除对应行后，再用 git add 明确添加该文件。
+app_mobile_*.py
+app_ws1080.py
+benchmark_*.py
+download_and_benchmark.py
+start_mediamtx.sh
+MediaMTX新版说明.txt
