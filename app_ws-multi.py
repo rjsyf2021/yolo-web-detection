@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 rjsyf2021
 # YOLO dual pipeline, standalone edition.
 # Run with ~/yolo_env/bin/python; keep existing .engine files beside this script.
 # No local runtime tests were performed for this revision.
@@ -2088,6 +2090,7 @@ async function startRtc(stream,generation){
 }
 
 </script>
+<footer class="hint">YOLO Web Detection · AGPL-3.0 · <a href="https://github.com/rjsyf2021/yolo-web-detection" target="_blank" rel="noopener noreferrer">源代码 / Source code</a></footer>
 </body>
 </html>
 

@@ -6,4 +6,4 @@
 - TensorRT/CUDA/NVIDIA 编解码组件：按 NVIDIA 对应版本的许可使用。
 - PyAV/FFmpeg、PyTorch、OpenCV、FastAPI、MediaMTX：各自适用其版本和构建所附许可。
 
-项目作者尚未指定本项目许可证。这里没有代替作者授予 MIT 等宽松许可；若选择 AGPL，请加入完整的对应 LICENSE，并核对模型来源和再分发要求。
+本项目原创部分采用 AGPL-3.0-only，见 LICENSE。第三方组件及模型仍适用各自的许可；发布模型前应核对来源及再分发要求。

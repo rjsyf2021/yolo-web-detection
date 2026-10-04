@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 rjsyf2021
 """Export the six rectangular engines used by app_ws-multi.py.
 
 Adapted from the project's original export_all_engines.py.
