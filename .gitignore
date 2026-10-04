@@ -38,11 +38,14 @@ Thumbs.db
 full-report.json
 full-1080-report.json
 video-benchmark.json
+fps-benchmark.json
 
-# 本机备用实现、基准脚本与本地说明（未纳入公开仓库）。
+# 本机备用实现、本地基准脚本与说明（未纳入公开仓库）。
 # 如需公开其中某项：删除对应行后，再用 git add 明确添加该文件。
+# benchmark_fps.py 已公开，用取反规则单独放行。
 app_mobile_*.py
 app_ws1080.py
 benchmark_*.py
+!benchmark_fps.py
 download_and_benchmark.py
 MediaMTX新版说明.txt
