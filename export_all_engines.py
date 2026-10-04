@@ -275,6 +275,20 @@ def main():
                 state = "已存在" if (BASE / name).exists() else "待导出"
                 print(f"{name}：标称 {w}×{h}，输入 {input_w}×{input_h} · {state} · {weights_state}")
         return
+    pending = []
+    skipped = 0
+    for variant in variants:
+        for h, w in all_sizes:
+            name = f"yolo26{variant}_{w}x{h}.engine"
+            if (BASE / name).exists() and not args.overwrite:
+                print(f"[跳过] 已存在：{name}；需要重新导出时使用 --overwrite", flush=True)
+                skipped += 1
+                continue
+            pending.append((variant, h, w))
+    if variants and not args.check_env and not pending:
+        print(f"完成：{len(variants)} 种型号，共 {len(variants) * len(all_sizes)} 档，"
+              f"跳过已存在 {skipped} 档。")
+        return
     if not args.check_env:
         if not variants:
             parser.error("未找到本地检测权重；请将自备的 yolo26n/s/m/l/x.pt 放在脚本目录，"
@@ -282,8 +296,8 @@ def main():
         # 先检查所有需要构建的型号，避免跑完部分档位后才发现缺少权重。
         missing = [f"yolo26{variant}.pt" for variant in variants
                    if not (BASE / f"yolo26{variant}.pt").is_file()
-                   and any(args.overwrite or not (BASE / f"yolo26{variant}_{w}x{h}.engine").exists()
-                           for h, w in all_sizes)]
+                   and any(pending_variant == variant
+                           for pending_variant, _, _ in pending)]
         if missing:
             parser.error("缺少自备权重：" + "、".join(missing))
 
@@ -298,20 +312,14 @@ def main():
     if args.check_env:
         return
     failed = []
-    skipped = 0
-    for variant in variants:
-        for h, w in all_sizes:
-            name = f"yolo26{variant}_{w}x{h}.engine"
-            if (BASE / name).exists() and not args.overwrite:
-                print(f"[跳过] 已存在：{name}；需要重新导出时使用 --overwrite", flush=True)
-                skipped += 1
-                continue
-            code = run_worker(h, w, args.overwrite, args.workspace, variant)
-            if code == 0:
-                continue
-            hint = "（可能被 OOM 或外部信号终止，请检查系统内存和显存）" if code in (137, -9) else ""
-            failed.append(f"yolo26{variant} {w}×{h}")
-            print(f"[失败] {name}：子进程退出码 {code}{hint}", flush=True)
+    for variant, h, w in pending:
+        name = f"yolo26{variant}_{w}x{h}.engine"
+        code = run_worker(h, w, args.overwrite, args.workspace, variant)
+        if code == 0:
+            continue
+        hint = "（可能被 OOM 或外部信号终止，请检查系统内存和显存）" if code in (137, -9) else ""
+        failed.append(f"yolo26{variant} {w}×{h}")
+        print(f"[失败] {name}：子进程退出码 {code}{hint}", flush=True)
     if failed:
         raise SystemExit("以下档位导出失败：" + "、".join(failed))
     print(f"完成：{len(variants)} 种型号，共 {len(variants) * len(all_sizes)} 档，跳过已存在 {skipped} 档。"
