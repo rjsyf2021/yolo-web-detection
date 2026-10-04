@@ -37,10 +37,11 @@ class EnginePool:
             self.engines[path.stem] = dict(
                 key=path.stem, path=str(path.resolve()), model=variant,
                 w=width, h=height, input_w=iw, input_h=ih,
-                label=f'{variant} · {width}×{height}',
+                label=f'YOLO26{variant} · {width}×{height}',
             )
         if not self.engines:
-            raise RuntimeError(f'在 {directory} 未找到 yolo26s_1440x1080.engine 这类引擎文件')
+            raise RuntimeError(f'在 {directory} 未找到引擎；请自备 YOLO26 n/s/m/l/x 检测引擎，'
+                               '按 yolo26m_1440x1080.engine 这类格式命名')
         if not torch.cuda.is_available():
             raise RuntimeError('CUDA 不可用，请在 GPU 服务器的原 YOLO 环境中启动')
         print('[engine] 发现引擎:', ', '.join(self.engines), flush=True)
@@ -101,6 +102,10 @@ class EnginePool:
             torch.cuda.empty_cache()
             while len(self.cache) > 1 and torch.cuda.mem_get_info()[0] < 1024**3:
                 evict_oldest()
+        # 失败原因留在预热报告中；可用目录只保留预热成功项。
+        # 已成功预热但因显存预算被逐出的模型仍可按需重新加载。
+        for key in report['failed']:
+            self.engines.pop(key, None)
         if report['evicted']:
             self.cache_size = max(1, min(self.cache_size, len(self.cache)))
         report.update(resident=list(self.cache), cache_limit=self.cache_size,
@@ -118,6 +123,8 @@ class EnginePool:
             raise ValueError('媒体宽高无效')
         if profile not in ('speed', 'balanced', 'detail'):
             raise ValueError('无效的检测策略')
+        if not self.engines:
+            raise ValueError('没有可用引擎，请检查启动预热日志')
         if requested != 'auto':
             if requested not in self.engines:
                 raise ValueError('所选引擎不存在，请刷新引擎列表')
@@ -135,7 +142,10 @@ class EnginePool:
         # 文件识别默认使用 detail，不设 1080p 上限；仍按原图大小选择，避免无意义放大。
         cap = {'speed': 720, 'balanced': 1080, 'detail': float('inf')}[profile]
         target_scale = min(1.0, cap / min(width, height))
-        priority = {'s': 0, 'n': 1, 'm': 2, 'l': 3, 'x': 4}
+        # 比例与输入尺寸优先；尺寸匹配度相同时，再按策略选择模型规模。
+        # 型号顺序表达资源偏好，不代表在任意素材上都有相同的准确率排序。
+        model_order = {'speed': 'nsmlx', 'balanced': 'snmlx', 'detail': 'xlmsn'}[profile]
+        priority = {variant: index for index, variant in enumerate(model_order)}
 
         def score(candidate):
             item, scale, coverage = candidate
@@ -1215,7 +1225,7 @@ HTML = r'''
  <div class="controls">
   <input id="file" type="file" accept="image/*,video/*" multiple>
   <label>引擎<select id="mediaEngine"><option value="auto">自动匹配比例与分辨率</option></select></label>
-  <label>策略<select id="profile"><option value="detail" selected>细节 · 高分辨率 / 接近原图</option><option value="balanced">均衡 · 1080p 优先</option><option value="speed">速度 · 720p 优先</option></select></label>
+  <label>策略<select id="profile"><option value="detail" selected>细节 · 接近原图 / 同尺寸优先大模型</option><option value="balanced">均衡 · 1080p / 同尺寸优先 s</option><option value="speed">速度 · 720p / 同尺寸优先 n</option></select></label>
   <label>视频输出<select id="output"><option value="original">保留原始分辨率</option><option value="nearest">适配引擎分辨率（保持比例）</option></select></label>
   <label>置信度<input id="mediaConfSlider" aria-label="图片视频置信度滑块" type="range" min="0" max="1" step=".01" value=".40"><input id="mediaConf" aria-label="图片视频置信度数值" type="number" min="0" max="1" step=".01" value=".40"></label>
   <label>同时处理<select id="mediaParallel"><option value="1">1 项</option><option value="2">2 项</option><option value="3" selected>3 项</option><option value="4">4 项</option></select></label>
@@ -1541,7 +1551,7 @@ function refreshLiveEngines(){
  const order={s:0,n:1,m:2,l:3,x:4};
  candidates.sort((a,b)=>b.h-a.h||b.w-a.w||(order[a.model]??99)-(order[b.model]??99));
  $('liveEngine').replaceChildren();
- for(const engine of candidates){const option=document.createElement('option');option.value=engine.key;option.textContent=`${engine.w}×${engine.h} · ${engine.model} 模型`;$('liveEngine').appendChild(option);}
+ for(const engine of candidates){const option=document.createElement('option');option.value=engine.key;option.textContent=engine.label;$('liveEngine').appendChild(option);}
  if(candidates.some(e=>e.key===previous))$('liveEngine').value=previous;
  else if(candidates.length){const preferred=[...candidates].sort((a,b)=>Math.abs(a.h-1080)-Math.abs(b.h-1080)||(order[a.model]??99)-(order[b.model]??99));$('liveEngine').value=preferred[0].key;}
  else{const option=document.createElement('option');option.value='';option.textContent='服务器没有该比例的模型';$('liveEngine').appendChild(option);}
@@ -2439,4 +2449,3 @@ async def realtime(websocket: WebSocket):
 if __name__ == '__main__':
     uvicorn.run(app, host='0.0.0.0', port=int(os.environ.get('PORT', '7860')),
                 ws_max_size=24 * 1024 * 1024, ws_max_queue=2, log_level='info')
-

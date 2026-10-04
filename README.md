@@ -3,6 +3,8 @@
 
 这是一个持续迭代的个人项目。代码由开发者结合 AI 辅助完成，性能取决于输入、模型、浏览器和服务器配置。
 
+**模型需由使用者自行准备。** 本仓库不提供模型权重（`.pt`）、ONNX 模型或 TensorRT 引擎（`.engine`），也不提供模型自动下载功能。使用者可准备兼容的引擎直接运行，或使用自备权重通过导出脚本生成引擎。
+
 ## 功能
 
 - 图片与完整视频上传，服务器推理、画框，结果预览和下载。
@@ -41,9 +43,9 @@ python -m pip install -r requirements.txt
 
 ### 2. 准备模型并启动
 
-已有权重可使用随附的 export_all_engines.py 导出六种引擎，具体命令见 [模型导出说明](docs/EXPORT.md)。
+将自行准备的 YOLO26 检测权重放在脚本目录，文件名为 `yolo26n.pt`、`yolo26s.pt`、`yolo26m.pt`、`yolo26l.pt` 或 `yolo26x.pt`。export_all_engines.py 会自动发现已有权重，为每个型号导出八种尺寸，也可用 `--models m l x` 指定型号。输出在脚本目录，具体命令见 [模型导出说明](docs/EXPORT.md)。直接使用这些引擎时运行 `python app_ws-multi.py`。已有兼容引擎的使用者无需准备 `.pt` 权重或执行导出。
 
-将自己导出的 TensorRT 引擎放在 models/，文件名必须符合当前扫描规则，例如 yolo26s_1280x720.engine、yolo26s_1920x1080.engine。当前扫描器只接受 yolo26[nsmxl]_宽x高.engine，不是任意 YOLO 版本的通用加载器。
+如果希望单独存放模型，可将自己导出的 TensorRT 引擎放在 models/，使用下方的 ENGINE_DIR 启动命令。文件名必须符合当前扫描规则，例如 yolo26s_1280x720.engine、yolo26s_1920x1080.engine。当前扫描器只接受 yolo26[nsmxl]_宽x高.engine，不是任意 YOLO 版本的通用加载器。
 
 文件名描述名义宽高，代码按 32 步幅计算输入尺寸；必须与实际引擎匹配，不能靠改名改变模型输入。引擎需要与部署环境兼容。
 
@@ -64,6 +66,8 @@ cp mediamtx.example.yml mediamtx.yml
 ~~~
 
 示例将 RTSP 8554 和信令 HTTP 8889 绑定回环地址，UDP 8189 用于 WebRTC 媒体传输；网页请求由应用代理信令。跨网访问还涉及防火墙、NAT 与 ICE，示例不是完整公网部署方案。已有正常工作的 MediaMTX 配置无需替换。
+
+也可在配置完成后使用 `./start.sh` 同时管理 MediaMTX 与应用。它需要 Linux、Bash 5.1+、`ss` 和 `setsid`；首次下载 MediaMTX 还需要 `curl`、`tar` 和网络。虚拟环境默认 `~/yolo_env`，可通过 `YOLO_VENV` 指定。脚本等待本次启动的 MediaMTX 监听 8554，默认超时 60 秒（可通过 `MEDIAMTX_START_TIMEOUT` 调整）；启动失败会退出，任一服务结束或按 Ctrl+C 会停止本次启动的另一服务。若已单独运行 MediaMTX，请直接启动 Python 应用。
 
 ## 配置
 
@@ -88,7 +92,7 @@ cp mediamtx.example.yml mediamtx.yml
 - 码率、帧率及分辨率优先均受浏览器实际支持限制。
 - 无账号鉴权或用户隔离，任务状态保存在单进程内存中。请用于受信任网络，不要直接裸露到公网，也不要开启多个 Uvicorn worker。
 - 停止是协作式取消，不能保证立即打断正在执行的推理或音轨合成。任务结果不是永久存储。
-- 当前发布整理只做源码检查，未在本机运行应用或测试，未完成最新版本服务器回归。
+- 未完成最新版本 GPU 与浏览器端到端验证。
 
 ## 故障排查
 
@@ -105,7 +109,8 @@ cp mediamtx.example.yml mediamtx.yml
 
 ~~~text
 app_ws-multi.py           单文件服务，内嵌页面与三条管线
-export_all_engines.py     六种矩形 TensorRT 引擎的导出工具
+export_all_engines.py     YOLO26 n/s/m/l/x 导出工具，每型号八种矩形尺寸
+start.sh                 同时管理 MediaMTX 与应用的启动、退出
 requirements.txt         应用层依赖；不负责安装 GPU 软件栈
 mediamtx.example.yml      WebRTC 局域网配置示例
 docs/EXPORT.md           模型导出、尺寸与覆盖行为说明
@@ -117,17 +122,19 @@ LICENSE                  AGPL-3.0 完整条款
 ## 首次使用：从模型到浏览器
 
 1. **确认 GPU 环境**：在原有虚拟环境运行 nvidia-smi 查看驱动/GPU；确认 PyTorch 能使用 CUDA，并且 Ultralytics 与 TensorRT 能加载或导出你的模型。不要直接用 requirements.txt 替代 GPU 环境安装步骤。
-2. **准备本地权重**：导出工具不自动下载权重。需要来源与许可明确的 yolo26n/s/m/l/x.pt，且安装的 Ultralytics 版本支持该模型。
-3. **导出引擎**：先导出一种尺寸检查环境，再按需导出剩余尺寸。导出需要显存、磁盘空间和时间。
-4. **启动服务**：设置 ENGINE_DIR，等待所有模型预热完成。预热失败信息应先排查，不能仅以端口打开判断模型可用。
+2. **准备本地权重**：导出工具不自动下载权重。按实际型号将自备权重命名为 yolo26n/s/m/l/x.pt 并放在脚本目录，安装的 Ultralytics 版本须支持该模型。当前支持检测任务，不包含分割、姿态或分类任务。
+3. **导出引擎**：先运行 --list 和 --check-env，再为选定型号批量导出八种尺寸，已有文件默认跳过。型号间输出文件互不覆盖。大模型需要更多显存、系统内存、磁盘空间和时间。
+4. **启动服务**：模型不在脚本目录时设置 ENGINE_DIR，等待所有模型预热完成。预热失败的模型会从可选列表中移除；全部失败则终止启动，应根据预热日志排查。
 5. **先试图片**：上传一张图片，确认模型、画框、预览和下载。
 6. **再试视频**：用较短的视频确认输出时长、尺寸与音轨；先选择同时处理1项，再比较提高并发后的总完成时间。
 7. **最后试实时**：先使用 HTTPS 页面验证 JPEG 摄像头路径，再启用 MediaMTX 与 WebRTC。
 
 ~~~bash
-# 已激活匹配的 GPU 环境，并已准备本地权重
-python export_all_engines.py --weights /path/to/yolo26s.pt --sizes 1280x720 --output-dir models
-ENGINE_DIR=./models MEDIA_WORKERS=2 python app_ws-multi.py
+# 以自备的 yolo26m.pt 为例，文件已放在脚本目录
+python export_all_engines.py --models m --list
+python export_all_engines.py --check-env
+python export_all_engines.py --models m
+MEDIA_WORKERS=2 python app_ws-multi.py
 ~~~
 
 ## 三种场景怎么选
@@ -146,6 +153,7 @@ ENGINE_DIR=./models MEDIA_WORKERS=2 python app_ws-multi.py
 ### 图片与视频
 
 - **模型/分辨率**：选择现有引擎，或由素材尺寸与比例参与自动选择。命名必须符合扫描规则，实际输入必须匹配导出设置。
+- **自动选择策略**：先匹配画幅与目标分辨率；匹配度相同时，速度策略优先 n，均衡优先 s，细节优先 x，缺少对应型号时从其余可用型号选择。手动指定引擎时按指定项执行。大模型不保证每种素材都更准确。
 - **输出尺寸**：根据页面选项选择输出策略；视频YUV420编码需要偶数宽高，必要时补边。
 - **置信度**：提高阈值会过滤更多低置信度结果；它不能保证消除所有重复框或误检。
 - **同时处理**：前端可选1–4项，服务端还受 MEDIA_WORKERS 限制。默认前端3项、服务端最多4项。增加并发会增加CPU、内存、编解码和GPU竞争。
@@ -162,6 +170,8 @@ ENGINE_DIR=./models MEDIA_WORKERS=2 python app_ws-multi.py
 - **低延迟**：应用只保留最新一张待处理帧，替换旧待处理帧；不取消正在执行的推理，也不能消除传输与播放缓冲。
 
 改变WebRTC码率、帧率或队列模式会重新建立实时会话，短暂断开属于当前实现行为。
+
+图片、视频和两条实时路径均可手动选择 YOLO26 n/s/m/l/x 引擎；实时列表默认仍优先接近 1080p 的 s 型号。使用 m/l/x 时可先将文件并发设为 1，并用 `ENGINE_CACHE_SIZE=1` 限制模型常驻数量。缓存限制不能解决单个模型本身超过可用显存的问题。
 
 ## 如何理解性能统计
 
@@ -201,4 +211,4 @@ ENGINE_DIR=./models MEDIA_WORKERS=2 python app_ws-multi.py
 
 当前以单文件分发，便于个人服务器替换部署。欢迎在Issue中提供可复现步骤、匿名化日志和配置；不要上传密码、令牌、真实网络配置或未经允许的人物素材。模型文件通常无需随Issue上传。
 
-本版本尚无自动化回归测试。新增变更应先在GPU服务器验证图片、带音轨视频、两条实时管线、横竖屏、取消任务和长时间运行，再记录结果；README中的历史数据不代表对每次提交的性能承诺。
+部署时可使用自备模型和素材，先确认图片、视频和需要的实时功能正常。README 中的历史数据不代表对每次提交的性能承诺。

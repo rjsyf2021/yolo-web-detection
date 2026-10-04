@@ -1,8 +1,8 @@
-"""批量导出最高 1080p 的 16:9 和 4:3 半精度 TensorRT 引擎。
+"""批量导出 YOLO26 n/s/m/l/x 检测模型的 16:9 和 4:3 半精度 TensorRT 引擎。
 
 使用 Ultralytics FP16 导出流程；当前 TensorRT 11 环境通过 ModelOpt
 在 CUDA GPU 0 上执行参考推理并选择混合精度。档位不超过 1080p，
-参考推理直接一次性采集全部中间输出，无需分组。
+参考推理一次性采集中间输出，较大模型需要更多显存与系统内存。
 ONNX 导出、参考推理、引擎构建分别使用独立子进程，单档失败后继续其余档位。
 """
 import argparse
@@ -19,9 +19,10 @@ from unittest.mock import patch
 
 
 BASE = Path(__file__).resolve().parent
+MODEL_VARIANTS = ("n", "s", "m", "l", "x")
 # 文件名保留标称尺寸，引擎实际输入需要向上对齐到 ALIGN 的倍数。
 ALIGN = 32
-# 顺序为（高，宽）。只导出最长边不超过 1080p 的档位；更高分辨率不再预生成。
+# 顺序为（高，宽）。标称高度最高 1080；更高分辨率不再预生成。
 widescreen = [
     (720, 1280),
     (1080, 1920),
@@ -89,7 +90,7 @@ def check_environment():
     free, total = torch.cuda.mem_get_info(0)
     print(f"[环境通过] {torch.cuda.get_device_name(0)} · CUDA 推理正常 · "
           f"空闲显存 {free / 1024**3:.1f}/{total / 1024**3:.1f} GiB。"
-          "参考推理在 GPU 上进行；最高 1080p 档位一次性采集即可，无需分组。", flush=True)
+          "参考推理在 GPU 上进行，中间输出仍占用系统内存；模型越大，资源需求越高。", flush=True)
 
 
 def require_cuda_provider(ort):
@@ -124,7 +125,7 @@ def gpu_reference_inference():
 
     def convert_on_cuda(*args, **kwargs):
         # Ultralytics 暂未透传此参数，覆盖 ModelOpt 默认的 providers=["cpu"]。
-        # 档位不超过 1080p，参考推理一次性采集全部中间输出即可，无需分组。
+        # 沿用完整中间输出采集；模型较大时仍需足够的显存与系统内存。
         kwargs["providers"] = ["cuda:0"]
         with patch.object(ort, "InferenceSession", cuda_session):
             return original_convert(*args, **kwargs)
@@ -134,10 +135,11 @@ def gpu_reference_inference():
         yield
 
 
-def run_stage(stage, directory, height, width, workspace=None):
+def run_stage(stage, directory, height, width, workspace=None, variant="s"):
     """各阶段独立进程：前一阶段退出后，才允许后一阶段分配 GPU 内存。"""
     command = [sys.executable, str(Path(__file__).resolve()), "--stage", stage,
-               "--worker", str(height), str(width), "--worker-dir", str(directory)]
+               "--worker", str(height), str(width), "--worker-dir", str(directory),
+               "--models", variant]
     if workspace is not None:
         command += ["--workspace", str(workspace)]
     completed = subprocess.run(command)
@@ -146,15 +148,18 @@ def run_stage(stage, directory, height, width, workspace=None):
                            "目标引擎未替换")
 
 
-def export_stage(stage, directory, height, width, workspace):
+def export_stage(stage, directory, height, width, workspace, variant="s"):
     directory = Path(directory)
     input_w, input_h = input_size(width, height)
-    onnx_file = directory / "yolo26s.onnx"
+    model_name = f"yolo26{variant}"
+    onnx_file = directory / f"{model_name}.onnx"
     if stage == "onnx":
         from ultralytics import YOLO
-        source = directory / "yolo26s.pt"
+        source = directory / f"{model_name}.pt"
         shutil.copy2(BASE / source.name, source)
         model = YOLO(str(source))
+        if model.task != "detect":
+            raise ValueError(f"{source.name} 不是检测模型，本应用仅支持 detect 任务")
         exported = model.export(format="onnx", imgsz=(input_h, input_w), quantize=32,
                                 device=0, batch=1, dynamic=False)
         if not exported or not Path(exported).is_file():
@@ -185,24 +190,26 @@ def export_stage(stage, directory, height, width, workspace):
                 metadata[key] = int(metadata[key])
         # 混合精度已写入 ONNX；quantize=None 避免再次触发参考推理。
         print("[构建] 使用已完成参考分析的 FP16/FP32 混合精度图", flush=True)
-        onnx2engine(str(directory / "yolo26s.fp16.onnx"), output_file=directory / "yolo26s.engine",
+        onnx2engine(str(directory / f"{model_name}.fp16.onnx"),
+                    output_file=directory / f"{model_name}.engine",
                     quantize=None, workspace=workspace, dynamic=False,
                     shape=(1, 3, input_h, input_w), metadata=metadata or None, prefix="[TensorRT] ")
 
 
-def export_one(height, width, overwrite=False, workspace=None, temp_parent=None):
+def export_one(height, width, overwrite=False, workspace=None, temp_parent=None, variant="s"):
     """三个串行子进程分别导出、参考分析、构建；全部成功才替换目标。"""
-    target = BASE / f"yolo26s_{width}x{height}.engine"
+    target = BASE / f"yolo26{variant}_{width}x{height}.engine"
     if target.exists() and not overwrite:
         print(f"[跳过] 已存在：{target.name}；需要重新导出时使用 --overwrite", flush=True)
         return target
-    if not (BASE / "yolo26s.pt").is_file():
-        raise FileNotFoundError(f"缺少模型权重：{BASE / 'yolo26s.pt'}")
+    weights = BASE / f"yolo26{variant}.pt"
+    if not weights.is_file():
+        raise FileNotFoundError(f"缺少模型权重：{weights}；请自行准备，脚本不会自动下载")
     with tempfile.TemporaryDirectory(prefix=".yolo-export-", dir=temp_parent or BASE) as directory:
-        print(f"[导出] {width}×{height}", flush=True)
+        print(f"[导出] yolo26{variant} · {width}×{height}", flush=True)
         for stage in ("onnx", "reference", "engine"):
-            run_stage(stage, directory, height, width, workspace)
-        engine = Path(directory) / "yolo26s.engine"
+            run_stage(stage, directory, height, width, workspace, variant)
+        engine = Path(directory) / f"yolo26{variant}.engine"
         if not engine.is_file() or engine.stat().st_size == 0:
             raise RuntimeError("未生成有效引擎")
         engine.replace(target)
@@ -210,9 +217,10 @@ def export_one(height, width, overwrite=False, workspace=None, temp_parent=None)
     return target
 
 
-def run_worker(height, width, overwrite=False, workspace=None):
+def run_worker(height, width, overwrite=False, workspace=None, variant="s"):
     """在独立子进程中导出单个档位，隔离内存并允许单档失败后继续其余档位。"""
-    command = [sys.executable, str(Path(__file__).resolve()), "--worker", str(height), str(width)]
+    command = [sys.executable, str(Path(__file__).resolve()), "--worker", str(height), str(width),
+               "--models", variant]
     if overwrite:
         command.append("--overwrite")
     if workspace is not None:
@@ -225,6 +233,8 @@ def run_worker(height, width, overwrite=False, workspace=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--models", nargs="+", choices=MODEL_VARIANTS,
+                        help="指定 YOLO26 型号（如 m l x）；省略时发现脚本目录中已有的对应 .pt 权重")
     parser.add_argument("--overwrite", action="store_true", help="重新导出并覆盖已有目标引擎")
     parser.add_argument("--list", action="store_true", help="只列出导出档位，不加载模型或使用 GPU")
     parser.add_argument("--check-env", action="store_true", help="检查 CUDA 13 环境并运行小型 GPU 推理，不导出引擎")
@@ -240,21 +250,42 @@ def main():
     if args.workspace is not None and (not math.isfinite(args.workspace) or args.workspace <= 0):
         parser.error("--workspace 必须是大于 0 的有限数值，单位为 GiB")
     if args.worker:
+        if not args.models or len(args.models) != 1:
+            parser.error("内部子进程需要用 --models 指定一个型号")
+        variant = args.models[0]
         height, width = args.worker
         if min(height, width) <= 0:
             parser.error("导出宽高必须大于 0")
         if args.stage:
-            export_stage(args.stage, args.worker_dir, height, width, args.workspace)
+            export_stage(args.stage, args.worker_dir, height, width, args.workspace, variant)
         else:
             export_one(height, width, overwrite=args.overwrite, workspace=args.workspace,
-                       temp_parent=args.worker_dir)
+                       temp_parent=args.worker_dir, variant=variant)
         return
+    variants = list(dict.fromkeys(args.models)) if args.models else [
+        variant for variant in MODEL_VARIANTS if (BASE / f"yolo26{variant}.pt").is_file()
+    ]
     if args.list:
-        for h, w in all_sizes:
-            input_w, input_h = input_size(w, h)
-            state = "已存在" if (BASE / f"yolo26s_{w}x{h}.engine").exists() else "待导出"
-            print(f"yolo26s_{w}x{h}.engine：标称 {w}×{h}，输入 {input_w}×{input_h} · {state}")
+        # 无本地权重时也能查看全部支持档位，不加载 GPU 依赖或下载文件。
+        for variant in variants or MODEL_VARIANTS:
+            weights_state = "权重就绪" if (BASE / f"yolo26{variant}.pt").is_file() else "需自备权重"
+            for h, w in all_sizes:
+                input_w, input_h = input_size(w, h)
+                name = f"yolo26{variant}_{w}x{h}.engine"
+                state = "已存在" if (BASE / name).exists() else "待导出"
+                print(f"{name}：标称 {w}×{h}，输入 {input_w}×{input_h} · {state} · {weights_state}")
         return
+    if not args.check_env:
+        if not variants:
+            parser.error("未找到本地检测权重；请将自备的 yolo26n/s/m/l/x.pt 放在脚本目录，"
+                         "也可用 --models 指定要导出的型号。脚本不会自动下载")
+        # 先检查所有需要构建的型号，避免跑完部分档位后才发现缺少权重。
+        missing = [f"yolo26{variant}.pt" for variant in variants
+                   if not (BASE / f"yolo26{variant}.pt").is_file()
+                   and any(args.overwrite or not (BASE / f"yolo26{variant}_{w}x{h}.engine").exists()
+                           for h, w in all_sizes)]
+        if missing:
+            parser.error("缺少自备权重：" + "、".join(missing))
 
     try:
         if args.check_env:
@@ -268,20 +299,22 @@ def main():
         return
     failed = []
     skipped = 0
-    for h, w in all_sizes:
-        if (BASE / f"yolo26s_{w}x{h}.engine").exists() and not args.overwrite:
-            print(f"[跳过] 已存在：yolo26s_{w}x{h}.engine；需要重新导出时使用 --overwrite", flush=True)
-            skipped += 1
-            continue
-        code = run_worker(h, w, args.overwrite, args.workspace)
-        if code == 0:
-            continue
-        hint = "（疑似被系统 OOM 杀死，内存不足）" if code in (137, -9) else ""
-        failed.append(f"{w}×{h}")
-        print(f"[失败] {w}×{h}：子进程退出码 {code}{hint}", flush=True)
+    for variant in variants:
+        for h, w in all_sizes:
+            name = f"yolo26{variant}_{w}x{h}.engine"
+            if (BASE / name).exists() and not args.overwrite:
+                print(f"[跳过] 已存在：{name}；需要重新导出时使用 --overwrite", flush=True)
+                skipped += 1
+                continue
+            code = run_worker(h, w, args.overwrite, args.workspace, variant)
+            if code == 0:
+                continue
+            hint = "（可能被 OOM 或外部信号终止，请检查系统内存和显存）" if code in (137, -9) else ""
+            failed.append(f"yolo26{variant} {w}×{h}")
+            print(f"[失败] {name}：子进程退出码 {code}{hint}", flush=True)
     if failed:
         raise SystemExit("以下档位导出失败：" + "、".join(failed))
-    print(f"完成：共 {len(all_sizes)} 档，跳过已存在 {skipped} 档。"
+    print(f"完成：{len(variants)} 种型号，共 {len(variants) * len(all_sizes)} 档，跳过已存在 {skipped} 档。"
           "重启 app_ws-multi.py 后可在图片 / 视频页面选择。")
 
 
