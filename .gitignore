@@ -39,9 +39,6 @@ full-report.json
 full-1080-report.json
 video-benchmark.json
 
-# 含本机绝对路径的启动脚本，仅本地使用，不公开。
-start.sh
-
 # 本机备用实现、基准脚本与本地说明（未纳入公开仓库）。
 # 如需公开其中某项：删除对应行后，再用 git add 明确添加该文件。
 app_mobile_*.py
