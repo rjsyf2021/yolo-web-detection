@@ -1,7 +1,4 @@
 # YOLO Web Detection
-
-基于 YOLO 与 TensorRT 的浏览器端目标检测系统，支持图片与视频批量处理、JPEG/WebSocket 和 WebRTC 实时检测，提供服务器画框、横竖屏适配及帧率、码率调节，适用于手机、平板和电脑。后端使用 FastAPI，在服务器集中执行推理。
-
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 
 这是一个持续迭代的个人项目。代码由开发者结合 AI 辅助完成，性能取决于输入、模型、浏览器和服务器配置。
