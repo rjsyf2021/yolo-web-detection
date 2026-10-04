@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
-# Copyright (C) 2026 rjsyf2021
-# YOLO dual pipeline, standalone edition.
-# Run with ~/yolo_env/bin/python; keep existing .engine files beside this script.
-# No local runtime tests were performed for this revision.
+# YOLO 双流水线服务，单文件独立版本。
+# 使用 ~/yolo_env/bin/python 启动；已有 .engine 文件放在本脚本同目录。
+# 运行依赖 CUDA、TensorRT 引擎；WebRTC 通道还需要先启动 MediaMTX。
 
-"""Shared GPU engine pool. Media and realtime own their input/output pipelines."""
+"""共享 GPU 引擎池；文件处理与实时检测分别管理各自的输入、输出流水线。"""
 from pathlib import Path
 import gc
 import math
@@ -19,6 +17,7 @@ import torch
 from ultralytics import YOLO
 
 
+# 共享引擎池：通过同一把锁串行访问模型，使用最近最少使用策略管理缓存。
 class EnginePool:
     def __init__(self, directory, cache_size=3):
         self.lock = threading.Lock()
@@ -33,7 +32,7 @@ class EnginePool:
             width, height = int(width), int(height)
             if min(width, height) <= 0:
                 continue
-            # Filename records nominal W x H; exported YOLO inputs are stride aligned.
+            # 从文件名读取标称宽×高，按 32 步长推定输入尺寸；此处未读取引擎内部形状。
             ih, iw = ((height + 31) // 32 * 32, (width + 31) // 32 * 32)
             self.engines[path.stem] = dict(
                 key=path.stem, path=str(path.resolve()), model=variant,
@@ -46,19 +45,20 @@ class EnginePool:
             raise RuntimeError('CUDA 不可用，请在 GPU 服务器的原 YOLO 环境中启动')
         print('[engine] 发现引擎:', ', '.join(self.engines), flush=True)
 
+    # 对外只暴露引擎描述信息，隐藏服务器上的模型文件路径。
     def catalog(self):
         return [{k: v for k, v in item.items() if k != 'path'}
                 for item in self.engines.values()]
 
     def warm_all(self, runs=5, keep_all=True):
-        """Called at startup before accepting requests; warm every discovered engine."""
+        """启动时预热所有发现的引擎，完成后再接收请求。"""
         if keep_all:
             self.cache_size = len(self.engines)
         report = dict(total=len(self.engines), runs=runs, warmed=[], failed={}, evicted=[])
         started = time.perf_counter()
         def attempt(image, engine):
-            # Returning only text releases the exception traceback (which can
-            # otherwise retain the failed model and GPU allocations during retry).
+            # 仅返回错误文本，以释放异常的回溯引用，
+            # 避免重试时仍保留加载失败的模型和显存分配。
             try:
                 for _ in range(runs):
                     self.predict(image, engine, .4, annotate=True)
@@ -96,8 +96,8 @@ class EnginePool:
                 print(f'[warmup] {key}: 失败（未标为就绪）: {error}', flush=True)
                 break
             del image
-            # Leave room for NVDEC/NVENC and concurrent file processing, rather
-            # than occupying every last byte with idle model contexts.
+            # 为 NVDEC/NVENC 和并发文件处理预留显存，
+            # 避免空闲模型上下文占满可用空间。
             torch.cuda.empty_cache()
             while len(self.cache) > 1 and torch.cuda.mem_get_info()[0] < 1024**3:
                 evict_oldest()
@@ -112,6 +112,7 @@ class EnginePool:
             raise RuntimeError('所有模型预热失败，请查看以上模型/显存/导出尺寸错误')
         return report
 
+    # 显式指定时直接返回该引擎；自动选择先匹配比例，再按策略比较目标分辨率。
     def select(self, width, height, requested='auto', profile='balanced'):
         if min(width, height) <= 0:
             raise ValueError('媒体宽高无效')
@@ -122,8 +123,8 @@ class EnginePool:
                 raise ValueError('所选引擎不存在，请刷新引擎列表')
             return self.engines[requested]
 
-        # First minimize letterbox area. 4% tolerance absorbs stride rounding;
-        # a 16:9 source will not tie with a 4:3 engine when both are present.
+        # 优先减少等比例缩放后的填充面积；允许覆盖率相差 4 个百分点以容纳步长取整，
+        # 同时存在两种比例时，16:9 画面不会与 4:3 引擎并列为最佳比例。
         candidates = []
         for item in self.engines.values():
             scale = min(item['input_w'] / width, item['input_h'] / height)
@@ -131,6 +132,7 @@ class EnginePool:
             candidates.append((item, scale, coverage))
         best_coverage = max(c[2] for c in candidates)
         candidates = [c for c in candidates if c[2] >= best_coverage - .04]
+        # 文件识别默认使用 detail，不设 1080p 上限；仍按原图大小选择，避免无意义放大。
         cap = {'speed': 720, 'balanced': 1080, 'detail': float('inf')}[profile]
         target_scale = min(1.0, cap / min(width, height))
         priority = {'s': 0, 'n': 1, 'm': 2, 'l': 3, 'x': 4}
@@ -138,12 +140,13 @@ class EnginePool:
         def score(candidate):
             item, scale, coverage = candidate
             ratio = scale / target_scale
-            # Prefer nearest resolution, with extra cost for needless upscaling.
+            # 优先选择最接近目标的分辨率，并对不必要的放大增加惩罚。
             distance = abs(math.log(ratio)) * (1.3 if ratio > 1 else 1.0)
             return (distance + .15 * (best_coverage - coverage),
                     priority[item['model']], item['input_w'] * item['input_h'], item['key'])
         return min(candidates, key=score)[0]
 
+    # 支持 BGR 数组或已预处理张量；返回图像（延后画框时为 Results，否则可为 None）、检测列表及耗时。
     def predict(self, bgr, engine, conf=.4, annotate=False, defer_plot=False):
         if not math.isfinite(conf) or not 0 <= conf <= 1:
             raise ValueError('置信度必须在 0 到 1 之间')
@@ -169,8 +172,8 @@ class EnginePool:
                 )[0]
                 if annotate or defer_plot:
                     result = result.cpu()
-                # Transfer only the packed detection table for realtime JSON.
-                # Do not copy a complete Results object for every realtime frame.
+                # 实时 JSON 仅需传回紧凑的检测框数据表，
+                # 因此无需为每一帧复制完整的 Results 对象。
                 packed_boxes = (result.boxes.data.detach().cpu().numpy()
                                 if result.boxes is not None else None)
             except Exception as exc:
@@ -180,7 +183,7 @@ class EnginePool:
                     f'{engine["input_w"]}×{engine["input_h"]}，请核对导出尺寸）: {exc}'
                 ) from exc
             infer_ms = (time.perf_counter() - started) * 1000
-        # Results are mapped back to the ORIGINAL BGR frame by Ultralytics.
+        # BGR 图像输入的检测框由 Ultralytics 映射回原图；张量输入另行还原坐标。
         detections = []
         if packed_boxes is not None:
             for row in packed_boxes:
@@ -192,14 +195,14 @@ class EnginePool:
         draw_ms = (time.perf_counter() - draw_started) * 1000 if annotate else 0.
         if drawn is not None and drawn.shape[:2] != bgr.shape[:2]:
             raise RuntimeError('检测输出尺寸与原始帧不一致，已停止输出以避免比例错误')
-        # A CPU Results object owns its image and boxes, independent of the next
-        # prediction. Only media requests defer plotting to another worker.
+        # CPU 上的 Results 保留当前图像和检测框，不依赖下一次推理；
+        # 只有文件处理请求会把画框延后交给另一工作线程。
         return (result if defer_plot else drawn), detections, dict(infer_ms=round(infer_ms, 2), wait_ms=round(wait_ms, 2), draw_ms=round(draw_ms, 2))
 
 
-"""Whole-file upload pipeline: decode on server -> YOLO -> server annotation.
+"""完整文件上传流水线：服务器解码 → YOLO 推理 → 服务器画框。
 
-Video uses source PTS, not processing speed or the realtime capture rate.
+视频采用源文件的显示时间戳（PTS），不以处理速度或实时采集帧率决定播放速度。
 """
 from fractions import Fraction
 from pathlib import Path
@@ -218,6 +221,7 @@ import cv2
 import numpy as np
 
 
+# 图片处理保持原图输出尺寸；进度回调也用于检查任务是否被取消。
 def process_image(source, target, pool, options, progress):
     raw = np.fromfile(source, dtype=np.uint8)
     image = cv2.imdecode(raw, cv2.IMREAD_COLOR)
@@ -236,9 +240,10 @@ def process_image(source, target, pool, options, progress):
                 detections=len(dets), frames=1, **timing)
 
 
+# 把视频帧转为连续 BGR 数组，并应用像素宽高比和旋转元数据。
 def oriented_bgr(frame, stream):
     image = frame.to_ndarray(format='bgr24')
-    # Normalize non-square pixels before rotating to the browser's display orientation.
+    # 先校正非正方形像素，再旋转到浏览器显示方向。
     sar = stream.sample_aspect_ratio
     if sar and sar > 0 and sar != 1:
         image = cv2.resize(image, (max(1, round(image.shape[1] * float(sar))), image.shape[0]))
@@ -253,28 +258,34 @@ def oriented_bgr(frame, stream):
     return np.ascontiguousarray(image)
 
 
+# 返回绘制尺寸和编码尺寸；两者的差异仅用于满足编码器的偶数宽高要求。
 def output_size(width, height, engine, mode):
     if mode == 'nearest':
-        # Fit within the selected engine's resolution WITHOUT changing source aspect.
+        # 保持源画面宽高比，缩小至选定引擎分辨率内，不放大原图。
         scale = min(1., engine['input_w'] / width, engine['input_h'] / height)
         width, height = max(2, round(width * scale)), max(2, round(height * scale))
     elif mode != 'original':
         raise ValueError('无效的输出尺寸模式')
-    # H.264 yuv420p requires even dimensions: add at most one border pixel.
+    # H.264 的 yuv420p 格式要求宽高为偶数：每个方向最多补一像素边缘。
     return width, height, width + width % 2, height + height % 2
 
 
 def ffmpeg_executable():
+    # 优先使用系统 ffmpeg（例如 apt 安装的 /usr/bin/ffmpeg）。
     executable = shutil.which('ffmpeg')
     if executable:
         return executable
+    # 仅当系统没有 ffmpeg 时才回退到可选的 imageio-ffmpeg。
+    # 动态导入可选依赖；实际走到此分支且包未安装时，仍会抛出下方的明确错误。
     try:
-        import imageio_ffmpeg
-        return imageio_ffmpeg.get_ffmpeg_exe()
+        import importlib
+        module = importlib.import_module('imageio_ffmpeg')
+        return getattr(module, 'get_ffmpeg_exe')()
     except ImportError as exc:
         raise RuntimeError('保留视频音轨需要 ffmpeg；请在服务器安装 ffmpeg 或 imageio-ffmpeg') from exc
 
 
+# 实际解码首帧以验证 NVDEC；失败时关闭容器，再尝试 CPU 解码。
 def open_video_decoder(av, source):
     notes = []
     for hardware in (True, False):
@@ -307,6 +318,7 @@ def open_video_decoder(av, source):
     raise RuntimeError('无法初始化视频解码')
 
 
+# 优先 NVENC，初始化失败时回退软件编码；两者使用相同的输出时间基。
 def open_video_encoder(av, path, fps, width, height, time_base):
     notes = []
     for codec in ('h264_nvenc', 'libx264'):
@@ -321,7 +333,7 @@ def open_video_encoder(av, path, fps, width, height, time_base):
             encoder.codec_context.max_b_frames = 0
             encoder.options = ({'preset': 'p4', 'rc': 'constqp', 'qp': '20'} if codec == 'h264_nvenc'
                                else {'preset': 'veryfast', 'crf': '20', 'tune': 'zerolatency'})
-            # Force device/codec initialization before accepting any real frames.
+            # 先初始化设备和编码器，确保在接收实际帧前发现初始化失败。
             output.start_encoding()
             return output, encoder, codec, notes
         except Exception as exc:
@@ -336,6 +348,7 @@ def open_video_encoder(av, path, fps, width, height, time_base):
     raise RuntimeError('无法初始化视频编码')
 
 
+# 用容量为 2 的队列预取解码帧；将生产线程异常传回消费方，退出时停止并回收线程。
 @contextmanager
 def decoded_prefetch(frames, stream):
     ready = queue.Queue(maxsize=2)
@@ -374,6 +387,7 @@ def decoded_prefetch(frames, stream):
         worker.join()
 
 
+# 文件视频逐帧保序处理，优先使用源时间戳；画框、编码分线程执行，有音轨时再合并。
 def process_video(source, target, pool, options, progress):
     try:
         import av
@@ -403,6 +417,7 @@ def process_video(source, target, pool, options, progress):
         del warm_image
         time_base = stream.time_base or Fraction(1, 90000)
         origin = (first.pts * first.time_base) if first.pts is not None else Fraction(0)
+        # 帧缺少时间戳时按帧率补算时长，并在结果中标记为 fallback。
         default_duration = max(1, round(Fraction(1, 1) / fps / time_base))
         timing_fallback = first.pts is None
         count = 0
@@ -441,7 +456,7 @@ def process_video(source, target, pool, options, progress):
                 cpu_result, _, timing = pool.predict(image, engine, options['conf'], defer_plot=True)
                 drawn = draw_worker.submit(draw_frame, cpu_result)
                 encode_pending.append(encode_worker.submit(write_frame, drawn, pts, duration, timing))
-                # Bound all outstanding draw/encode work; preserve every frame and order.
+                # 限制尚未完成的画框、编码任务数量，同时保留全部帧及其顺序。
                 if len(encode_pending) >= 3:
                     encode_pending.popleft().result()
 
@@ -476,7 +491,7 @@ def process_video(source, target, pool, options, progress):
                     progress(frames=count, processing_fps=round(count / max(elapsed, .001), 2),
                              draw_ms=round(draw_total / count, 2), encode_ms=round(encode_total / count, 2))
 
-            # One-frame lookahead preserves variable frame durations, with constant memory.
+            # 向前读取一帧，通过相邻时间戳计算可变帧时长，避免缓存整个视频。
             pending, pending_pts, pending_image = first, 0, first_image
             with decoded_prefetch(frames, stream) as prefetched:
                 for frame, decoded_image in prefetched:
@@ -503,7 +518,7 @@ def process_video(source, target, pool, options, progress):
     duration_seconds = float(last_end * time_base)
     if has_audio:
         progress(stage='muxing', frames=count)
-        # The video has been rebased to its first PTS. Apply the same offset to audio.
+        # 视频已将首帧时间戳归零；音频应用同样偏移以保持同步。
         command = [ffmpeg, '-hide_banner', '-loglevel', 'error', '-y',
                    '-i', intermediate, '-itsoffset', str(-float(origin)), '-i', str(source),
                    '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy',
@@ -530,7 +545,7 @@ def process_video(source, target, pool, options, progress):
                 infer_ms=round(infer_total / max(count, 1), 2), elapsed=round(elapsed, 2))
 
 
-"""Realtime JPEG decode/inference, independent of the file-processing pipeline."""
+"""实时 JPEG 解码与推理，独立于文件处理流水线。"""
 import threading
 import time
 
@@ -545,6 +560,7 @@ except ImportError:
     nvimgcodec = None
 
 
+# 实时 JPEG 通道：客户端画框时返回检测列表与统计信息，服务器画框时还返回标注 JPEG。
 class RealtimePipeline:
     def __init__(self, pool):
         self.pool = pool
@@ -553,6 +569,7 @@ class RealtimePipeline:
         self.warned = False
         self.retry_decoder_after = 0.
 
+    # GPU 解码失败后进入 30 秒冷却期，期间使用 OpenCV，避免每帧重复初始化失败。
     @torch.inference_mode()
     def process(self, raw, config):
         if len(raw) > 20 * 1024 * 1024:
@@ -609,14 +626,14 @@ class RealtimePipeline:
                         if any(padding):
                             tensor = functional.pad(tensor, padding, value=114 / 255)
                     else:
-                        # Usual camera path: dimensions already match the model.
-                        # Pad byte pixels before float conversion to reduce temporary storage.
+                        # 常见摄像头路径：画面无需缩放，只需按引擎尺寸补边。
+                        # 先对字节像素补边，再转浮点数，以减少临时显存占用。
                         if any(padding):
                             tensor = functional.pad(tensor, padding, value=114)
                         tensor = tensor.to(device='cuda:0', dtype=torch.float32,
                                            memory_format=torch.contiguous_format).div_(255).unsqueeze(0)
                     tensor = tensor.contiguous()
-                    # Complete work before this decoder is reused by another thread.
+                    # 等待当前 CUDA 流完成，之后才允许其他线程复用解码器。
                     torch.cuda.current_stream().synchronize()
                     decoder_name = 'nvImageCodec / DLPack'
             except Exception as exc:
@@ -638,7 +655,7 @@ class RealtimePipeline:
         decode_ms = (time.perf_counter() - started) * 1000
         _, detections, timing = self.pool.predict(input_image, engine, float(config.get('conf', .4)))
         if tensor is not None:
-            # Tensor sources return boxes in padded engine coordinates. Undo our letterbox.
+            # 张量输入返回补边后引擎坐标系中的检测框，需逆向消除补边与缩放。
             sx, sy = resized_w / width, resized_h / height
             for detection in detections:
                 x1, y1, x2, y2 = detection['box']
@@ -651,7 +668,7 @@ class RealtimePipeline:
                     decode_ms=round(decode_ms, 2), decoder=decoder_name, **timing)
 
 
-"""WHIP signalling and local RTSP receiver, independent of JPEG; no aiortc."""
+"""WHIP 信令与本地 RTSP 接收流程，独立于 JPEG 通道，不依赖 aiortc。"""
 import asyncio
 import math
 import os
@@ -669,7 +686,7 @@ from fastapi import HTTPException, WebSocket
 
 
 class AnnotatedRTSPPublisher:
-    """Owned by one session executor; all codec calls stay on that thread."""
+    """由单个会话执行器管理，所有编解码调用固定在该工作线程上。"""
     def __init__(self, base, path):
         self.base, self.path = base, path
         self.output = None
@@ -685,7 +702,7 @@ class AnnotatedRTSPPublisher:
         output, self.output = self.output, None
         self.ready = False
         if output is not None:
-            # Live stop discards buffered tail; never wait to play obsolete frames.
+            # 停止实时流时直接关闭输出，不显式排空编码器中的尾帧。
             output.close()
 
     def open(self, width, height, bitrate, fps=60):
@@ -693,7 +710,7 @@ class AnnotatedRTSPPublisher:
         opened_at = time.perf_counter()
         self.close()
         self.epoch += 1
-        # Same path pattern as the existing MediaMTX configuration: no YAML edit.
+        # 采用现有 MediaMTX 配置允许的路径格式，无需修改 YAML。
         self.output_path = 'yolo-' + uuid.uuid4().hex
         self.shape = (width, height, bitrate, fps)
         self.origin = None
@@ -736,7 +753,7 @@ class AnnotatedRTSPPublisher:
     def write(self, image, stamp, bitrate, fps=60):
         import av
         height, width = image.shape[:2]
-        # YUV420 requires even dimensions. Add a border, never stretch.
+        # YUV420 要求宽高为偶数；通过补边满足要求，不拉伸画面。
         if width % 2 or height % 2:
             image = cv2.copyMakeBorder(image, 0, height % 2, 0, width % 2, cv2.BORDER_REPLICATE)
             height, width = image.shape[:2]
@@ -759,6 +776,7 @@ class AnnotatedRTSPPublisher:
                     encoder_init_ms=self.init_ms)
 
 
+# 注册 WebRTC 信令、结果及回放接口；媒体经 MediaMTX 转为本地 RTSP 处理。
 def install_webrtc(app, get_pool):
     sessions = {}
     whip_base = os.environ.get('MEDIAMTX_HTTP', 'http://127.0.0.1:8889').rstrip('/')
@@ -794,6 +812,7 @@ def install_webrtc(app, get_pool):
         with urllib.request.urlopen(request, timeout=12) as response:
             return response.read(250000).decode('utf-8'), response.headers.get('Location')
 
+    # 幂等关闭会话：先停止接收，再回收播放连接、发布器及其所属执行线程。
     async def close_session(session):
         if session.get('closing'):
             return
@@ -823,6 +842,7 @@ def install_webrtc(app, get_pool):
                 await asyncio.to_thread(executor.shutdown, wait=True)
         sessions.pop(session['id'], None)
 
+    # 读取 RTSP 帧；先进先出模式等待队列空间，最新帧模式替换积压帧以降低延迟。
     def read_stream(session):
         ready, stop = session['frames'], session['stop']
         def put(value):
@@ -894,9 +914,9 @@ def install_webrtc(app, get_pool):
                 if not first:
                     put(('error', str(exc)))
                     return
-                # Invalid compressed input alone does not establish hardware incompatibility.
-                # Retry the initial RTSP attachment once with the same decoder, within
-                # the original startup deadline. Never loop indefinitely on bad input.
+                # 压缩输入无效不一定意味着硬件不兼容。
+                # 在原始启动期限内，使用同一解码器重试一次 RTSP 初始连接，
+                # 避免因错误输入无限重试。
                 if (hardware and type(exc).__name__ == 'InvalidDataError'
                         and startup_invalid_retries < 1 and time.monotonic() < deadline - 4):
                     startup_invalid_retries += 1
@@ -917,7 +937,7 @@ def install_webrtc(app, get_pool):
                     container.close()
 
     def detect(image, config, session, stamp):
-        # Same full-frame contain as JPEG: no crop, stretch, or inferred rotation.
+        # 与 JPEG 一样等比例容纳完整画面，不裁剪、拉伸或自行推断旋转方向。
         height, width = image.shape[:2]
         w, h = config['width'], config['height']
         scale = min(w / width, h / height)
@@ -936,6 +956,7 @@ def install_webrtc(app, get_pool):
             output_info = session['publisher'].write(drawn, stamp, config['bitrate'], config['fps'])
             output_info['server_encode_ms'] = round((time.perf_counter()-encode_started)*1000, 2)
             dets = []
+        # WebRTC 检测框按处理画幅归一化；前端再乘显示宽高，JPEG 通道则直接返回像素坐标。
         for det in dets:
             x1, y1, x2, y2 = det['box']
             det['box'] = [x1/w, y1/h, x2/w, y2/h]
@@ -963,8 +984,8 @@ def install_webrtc(app, get_pool):
         sessions[sid] = session
         url = whip_base + '/' + session['path'] + '/whip'
         try:
-            # The inference/encoder thread exists before media starts arriving.
-            # Keep CUDA initialization, warmup, and all encoder calls on this owner.
+            # 在媒体帧到达前创建推理与编码线程，
+            # 将 CUDA 初始化、预热及所有编码调用固定到该线程。
             session['executor'] = ThreadPoolExecutor(max_workers=1, thread_name_prefix='rtc-process')
             session['publisher'] = AnnotatedRTSPPublisher(rtsp_base, session['path'])
             def warmup():
@@ -980,8 +1001,8 @@ def install_webrtc(app, get_pool):
                     session['publisher'].open(config['width']+config['width']%2,
                                               config['height']+config['height']%2, config['bitrate'], config['fps'])
                 return model_ms
-            # Warm the exact processing path before negotiating a publisher.
-            # No incoming frames can pile up behind initial model loading.
+            # 先预热实际使用的处理路径，再协商发布连接，
+            # 避免模型首次加载期间积压输入帧。
             session['warmup_ms'] = await asyncio.wrap_future(session['executor'].submit(warmup))
             if session['closing']:
                 raise RuntimeError('实时会话已关闭')
@@ -1104,7 +1125,7 @@ def install_webrtc(app, get_pool):
         if len(session['playbacks']) >= 2:
             raise HTTPException(429, '请先关闭旧播放连接')
         pid = uuid.uuid4().hex
-        session['playbacks'][pid] = None  # Reserve before yielding to concurrent requests.
+        session['playbacks'][pid] = None  # 在让出执行权前预留名额，防止并发请求超出连接上限。
         url = whip_base + '/' + session['output_path'] + '/whep'
         location = None
         try:
@@ -1194,7 +1215,7 @@ HTML = r'''
  <div class="controls">
   <input id="file" type="file" accept="image/*,video/*" multiple>
   <label>引擎<select id="mediaEngine"><option value="auto">自动匹配比例与分辨率</option></select></label>
-  <label>策略<select id="profile"><option value="balanced">均衡 · 1080p 优先</option><option value="detail">细节 · 接近原始尺寸</option><option value="speed">速度 · 720p 优先</option></select></label>
+  <label>策略<select id="profile"><option value="detail" selected>细节 · 高分辨率 / 接近原图</option><option value="balanced">均衡 · 1080p 优先</option><option value="speed">速度 · 720p 优先</option></select></label>
   <label>视频输出<select id="output"><option value="original">保留原始分辨率</option><option value="nearest">适配引擎分辨率（保持比例）</option></select></label>
   <label>置信度<input id="mediaConfSlider" aria-label="图片视频置信度滑块" type="range" min="0" max="1" step=".01" value=".40"><input id="mediaConf" aria-label="图片视频置信度数值" type="number" min="0" max="1" step=".01" value=".40"></label>
   <label>同时处理<select id="mediaParallel"><option value="1">1 项</option><option value="2">2 项</option><option value="3" selected>3 项</option><option value="4">4 项</option></select></label>
@@ -1203,6 +1224,7 @@ HTML = r'''
   <button id="stopTask" disabled>停止所有进行中任务</button>
  </div>
  <div class="hint">支持混合多选图片和视频，再次选择可追加。可同时处理 1 或 2 项；每项可单独预览和下载。并发提高整体吞吐，单个视频的 FPS 可能降低。停止按钮暂停后续队列并停止所有进行中任务。</div>
+ <div class="hint">默认按原图尺寸自动匹配现有模型，支持高于 1080p 的引擎；也可手动选择。高分辨率需要更多显存，处理大图或高分辨率视频时建议同时处理 1 项。</div>
  <div id="batchStatus" class="status" role="status"></div>
  <div id="batchList"></div>
  <div id="mediaStatus" class="status" role="status">请选择图片或视频。</div><progress id="progress" max="100" value="0" hidden></progress>
@@ -1255,7 +1277,9 @@ function kindOf(file){if(file.type.startsWith('image/')||/\.(jpe?g|png|webp|bmp|
 async function jsonResponse(response){let value;try{value=await response.json();}catch{throw new Error(`服务器响应异常（HTTP ${response.status}）`);}if(!response.ok)throw new Error(typeof value.detail==='string'?value.detail:JSON.stringify(value.detail||value));return value;}
 async function loadEngines(){
  const data=await jsonResponse(await fetch('/api/engines'));catalog=data.engines;
- for(const engine of catalog){const option=document.createElement('option');option.value=engine.key;option.textContent=engine.label;$('mediaEngine').appendChild(option);}
+ // 文件识别展示全部已发现引擎，按标称像素数降序排列，便于选择高分辨率。
+ const mediaEngines=[...catalog].sort((a,b)=>b.w*b.h-a.w*a.h||a.key.localeCompare(b.key));
+ for(const engine of mediaEngines){const option=document.createElement('option');option.value=engine.key;option.textContent=engine.label;$('mediaEngine').appendChild(option);}
  for(const option of $('liveAspect').options)option.disabled=!enginesForAspect(option.value).length;
  if(!enginesForAspect($('liveAspect').value).length){const available=[...$('liveAspect').options].find(o=>!o.disabled);if(available)$('liveAspect').value=available.value;}
  refreshLiveEngines();
@@ -1265,7 +1289,7 @@ $('mediaTab').onclick=()=>{stopLive();$('mediaSection').hidden=false;$('liveSect
 $('liveTab').onclick=()=>{$('sourceVideo').pause();$('resultVideo').pause();$('mediaSection').hidden=true;$('liveSection').hidden=false;$('liveTab').classList.add('active');$('mediaTab').classList.remove('active');};
 function videoHardwareInfo(m){
  if(!m.video_decoder)return '';
- // The pipeline label is reported by the server, not inferred from codec names.
+ // 流水线名称由服务器上报，不根据编解码器名称推断。
  let text=`\n解码：${m.video_decoder} · 编码：${m.video_encoder||'初始化中'} · 画框：CPU`;
  if(Number.isFinite(m.draw_ms))text+=`\n平均画框 ${m.draw_ms}ms · 编码调用与封装 ${m.encode_ms}ms / 帧`;
  if(m.hardware_notes?.length)text+='\n'+m.hardware_notes.join('\n');
@@ -1507,7 +1531,7 @@ for(const id of ['mediaConf','liveConf']){
 
 function enginesForAspect(value){
  const ratio=value==='4:3'?4/3:16/9;
- // Tolerate the few padding rows in stride-aligned engine filenames.
+ // 允许标称画幅与按步长对齐的引擎尺寸之间存在少量补边差异。
  return catalog.filter(e=>Math.abs(Math.log((e.w/e.h)/ratio))<.05);
 }
 function selectedLiveEngine(){return catalog.find(e=>e.key===$('liveEngine').value);}
@@ -1524,6 +1548,7 @@ function refreshLiveEngines(){
  $('start').disabled=!!cameraStream||!candidates.length;
  invalidateLiveView();
 }
+// 配置或画幅变化时递增版本号，用于丢弃旧配置下尚未返回的检测结果。
 function invalidateLiveView(){liveRevision++;lastDets=[];lastVideoTime=-1;geometryKey='';liveContext.clearRect(0,0,$('liveCanvas').width,$('liveCanvas').height);}
 $('liveAspect').onchange=()=>{refreshLiveEngines();if(cameraStream)void startLive();};
 $('liveEngine').onchange=()=>{invalidateLiveView();if(cameraStream)void startLive();};
@@ -1535,6 +1560,7 @@ function updateResultSurface(){
 }
 $('liveRender').onchange=()=>{updateResultSurface();if(cameraStream)void startLive();};
 let pendingServerJPEG=null,serverJPEGDecoding=false,paintedJPEGId=0;
+// 显示端仅保留最新待解码图片；服务端 FIFO 处理不意味着浏览器逐帧展示所有结果。
 function queueServerJPEG(data,jpeg,generation){
  pendingServerJPEG={data,jpeg,generation};
  if(serverJPEGDecoding)return;
@@ -1570,11 +1596,11 @@ function updateLiveGeometry(){
  const key=`${sourceWidth}:${sourceHeight}:${aspect}:${engine.key}:${orientation}`;
  if(key===geometryKey)return;
  const [baseW,baseH]=aspect==='4:3'?[4,3]:[16,9];
- // The video element is authoritative; track settings may report swapped axes.
+ // 以视频元素的实际尺寸为准；轨道设置中的宽高可能互换。
  const portrait=orientation==='portrait'||(orientation==='auto'&&sourceHeight>sourceWidth);
  const [rw,rh]=portrait?[baseH,baseW]:[baseW,baseH];
- // Keep the selected nominal pixel count; swap capture axes in portrait.
- // Example: a 1920x1088 engine receives a 1920x1080 JPEG, padded on the GPU.
+ // 在标称尺寸内按所选比例向下取整，竖屏时交换输出宽高；不旋转源像素。
+ // 例如：1920×1088 引擎接收 1920×1080 的 JPEG 后，在 GPU 上补边。
  const unit=Math.max(1,Math.floor(Math.min(engine.w/baseW,engine.h/baseH)));
  const width=rw*unit,height=rh*unit;
  const fit=Math.min(width/sourceWidth,height/sourceHeight);
@@ -1585,7 +1611,7 @@ function updateLiveGeometry(){
  geometryKey=key;liveRevision++;lastDets=[];lastDetTime=0;lastVideoTime=-1;
  currentWidth=width;currentHeight=height;
  $('liveCanvas').width=width;$('liveCanvas').height=height;
- // Show the entire video using the same contain layout as the transmitted JPEG.
+ // 采用与上传 JPEG 相同的等比例容纳布局，显示完整视频。
  video.style.aspectRatio=`${rw} / ${rh}`;video.style.objectFit='contain';
  video.style.background='#000';
 }
@@ -1627,8 +1653,9 @@ function receiveLiveResult(event,generation){
   message('liveStatus',cameraRequestLabel+'\n已连接，持续发送最新画面（首次加载引擎可能稍慢）');return;
  }
  if(data.type!=='result'){if(data.error)message('liveStatus',data.error);return;}
- // Track connection health without making capture wait for replies.
+ // 监测连接状态，但不让采集流程等待回复。
  const now=performance.now();lastResponseAt=now;
+ // 会话编号在入口检查；这里再过滤旧画幅版本及重复、乱序结果。
  if(data.revision!==liveRevision||data.id<=lastResultId)return;
  lastResultId=data.id;
  if(data.error){message('liveStatus','检测失败：'+data.error);return;}
@@ -1639,7 +1666,7 @@ function receiveLiveResult(event,generation){
  lastDetTime=age<=500?data.captured_at:0;
  received++;
  const elapsed=(now-lastStatsAt)/1000;
- if(now-lastStatusAt<250)return; // Update statistics at 4 Hz; boxes still update on every result.
+ if(now-lastStatusAt<250)return; // 统计信息每秒更新 4 次，检测框仍随每次结果更新。
  lastStatusAt=now;
  const ms=value=>Number.isFinite(value)?value.toFixed(1)+'ms':'—';
  const roundtrip=Number.isFinite(data.sent_at)?now-data.sent_at:NaN;
@@ -1659,7 +1686,7 @@ async function startLive(){
   const device=$('camera').value;
   const [rw,rh]=$('liveAspect').value==='4:3'?[4,3]:[16,9];
   const unit=Math.max(1,Math.floor(Math.min(engine.w/rw,engine.h/rh)));
-  // Initial device orientation is only a request hint. After opening, use videoWidth/videoHeight.
+  // 初始设备方向仅作为请求提示；打开后以 videoWidth/videoHeight 为准。
   const orientation=$('liveOrientation').value;
   const portraitHint=orientation==='portrait'||(orientation==='auto'&&window.matchMedia('(pointer: coarse)').matches&&
    (screen.orientation?.type?.startsWith('portrait')??window.matchMedia('(orientation: portrait)').matches));
@@ -1670,7 +1697,7 @@ async function startLive(){
   let acquired,fallback=false;
   const relaxed={...constraints,frameRate:{ideal:targetFps,max:targetFps}};
   const swapped={...constraints,width:{exact:requestedHeight},height:{exact:requestedWidth}};
-  // Preserve requested geometry before allowing a lower-resolution fallback.
+  // 先尝试精确尺寸和交换宽高，再放宽帧率、尺寸；ideal 回退不保证分辨率更低。
   const attempts=[constraints,swapped,relaxed,{...swapped,frameRate:relaxed.frameRate},
    {...relaxed,width:{ideal:requestedWidth},height:{ideal:requestedHeight}}];
   for(let index=0;index<attempts.length;index++){
@@ -1744,7 +1771,7 @@ async function sendCapture(){
   if(generation!==liveGeneration)return;
   if(!blob){
    if(!workerFailed)encoderLabel='兼容编码';
-   // Fallback keeps the original canvas path; worker mode no longer draws twice.
+   // 回退时保留原有画布流程；工作线程模式避免重复绘制。
    if(capture.width!==geometry.width||capture.height!==geometry.height){capture.width=geometry.width;capture.height=geometry.height;}
    const drawStart=performance.now();
    captureContext.fillStyle='#000';captureContext.fillRect(0,0,geometry.width,geometry.height);
@@ -1759,11 +1786,11 @@ async function sendCapture(){
   if(generation!==liveGeneration||revision!==liveRevision||connection!==socket||connection.readyState!==WebSocket.OPEN||connection.bufferedAmount>bufferLimit())return;
   lastJpegBytes=blob.size;
   const id=++sequence;
-  // No outstanding-frame counter or ACK gate. Metadata travels with every JPEG.
+  // 不设置未确认帧计数或确认应答门槛，每张 JPEG 都随附对应元数据。
   connection.send(JSON.stringify({type:'frame',id,revision,captured_at:capturedAt,
    sent_at:performance.now(),draw_ms:drawMs,encode_ms:encodeMs,
    jpeg_quality:quality,buffered_bytes:connection.bufferedAmount,engine,conf,render:$('liveRender').value}));
-  connection.send(blob); // WebSocket accepts Blob directly; avoid the ArrayBuffer copy.
+  connection.send(blob); // WebSocket 可直接发送 Blob，省去复制到 ArrayBuffer 的步骤。
   liveSentCount++;
   if(!firstSentAt)firstSentAt=performance.now();
   return true;
@@ -1774,8 +1801,8 @@ async function continuousCapture(generation){
  while(generation===liveGeneration&&liveReady){
   updateLiveGeometry();
   const sent=await sendCapture();
-  // Encoding already yielded to the browser. Do not add a timer after a sent frame.
-  // If no new frame or the socket is backed up, back off instead of busy looping.
+  // 编码时已让出执行权给浏览器；成功发送一帧后无需额外定时等待。
+  // 没有新帧或连接发送积压时，短暂等待，避免空转。
   if(!sent)await sleep(4);
  }
 }
@@ -1785,6 +1812,7 @@ function render(){
   updateLiveGeometry();
   if(rtcPeer)syncRtcConfig();
   if(liveGeometry&&!serverRendering()){
+   // 客户端将近期检测框叠加到当前摄像头画面；严格同帧标注需使用服务器画框模式。
    const g=liveGeometry,video=$('cameraVideo'),fresh=performance.now()-lastDetTime<500;
    const signature=`${liveGeneration}:${liveRevision}:${video.currentTime}:${lastDetTime}:${fresh}`;
    if(signature!==renderedSignature){
@@ -1818,7 +1846,7 @@ function prepareRtcReceiver(generation){
  const codecs=RTCRtpReceiver.getCapabilities?.('video')?.codecs?.filter(c=>c.mimeType.toLowerCase()==='video/h264');
  if(codecs?.length&&transceiver.setCodecPreferences)transceiver.setCodecPreferences(codecs);
  const ready=(async()=>{await peer.setLocalDescription(await peer.createOffer());await iceReady(peer);})();
- ready.catch(()=>{}); // Observed when the prepared receiver is consumed below.
+ ready.catch(()=>{}); // 此处先接住拒绝状态，后续使用预建接收器时再处理错误。
  rtcPreparedReceiver={peer,transceiver,ready,generation};
 }
 function preferLowDelay(receiver){
@@ -2028,7 +2056,7 @@ async function startRtc(stream,generation){
   }
  };
  const offer=await peer.createOffer();if(generation!==liveGeneration)return;
- // Do not negotiate RTP camera-orientation metadata: RTSP cannot preserve it.
+ // 不协商 RTP 摄像头方向扩展，因为 RTSP 无法保留该元数据。
  offer.sdp=offer.sdp.split('\r\n').filter(line=>!(line.startsWith('a=extmap:')&&line.includes('urn:3gpp:video-orientation'))).join('\r\n');
  await peer.setLocalDescription(offer);await iceReady(peer);if(generation!==liveGeneration)return;
  const controller=new AbortController();rtcFetch=controller;
@@ -2058,7 +2086,7 @@ async function startRtc(stream,generation){
   if(data.type==='pong'){if(Number.isFinite(data.sent_at))rtcRtt=now-data.sent_at;return;}
   if(data.type!=='rtc_result'||data.revision!==liveRevision||data.id<=lastResultId)return;
   const g=liveGeometry;if(!g)return;
-  // Never rotate boxes based on track settings; reject mismatched frame orientation.
+  // 不根据轨道设置旋转检测框；画面方向不匹配时拒绝使用结果。
   if(Math.abs(Math.log((data.source_width/data.source_height)/(g.sourceWidth/g.sourceHeight)))>.03){
    lastDets=[];
    message('liveStatus',`等待视频方向同步：本地 ${g.sourceWidth}×${g.sourceHeight}，服务器 ${data.source_width}×${data.source_height}。若持续不一致，请停止后重新开始或切换 JPEG。`);
@@ -2090,16 +2118,15 @@ async function startRtc(stream,generation){
 }
 
 </script>
-<footer class="hint">YOLO Web Detection · AGPL-3.0 · <a href="https://github.com/rjsyf2021/yolo-web-detection" target="_blank" rel="noopener noreferrer">源代码 / Source code</a></footer>
 </body>
 </html>
 
 '''
 
-"""YOLO dual pipeline server. Run on the GPU server: python app_ws-multi.py.
+"""YOLO 双流水线服务器，在 GPU 服务器运行：python app_ws-multi.py。
 
-Standalone distribution: frontend and pipeline modules are embedded in this file.
-ENGINE_DIR defaults to this directory; set it to the existing engine directory.
+检测逻辑、媒体流水线与网页已内嵌在本文件中，无需额外的拆分模块。
+ENGINE_DIR 默认指向脚本目录，可通过环境变量指定已有引擎的存放目录。
 """
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -2131,6 +2158,7 @@ pool = None
 live_pipeline = None
 
 
+# 清理结束超过六小时且没有下载者的任务，下载期间通过 readers 计数保护结果。
 def cleanup_jobs():
     with jobs_lock:
         expired = [job_id for job_id, job in jobs.items()
@@ -2138,10 +2166,11 @@ def cleanup_jobs():
                    and time.time() - job['updated'] > 6 * 3600]
         for job_id in expired:
             job = jobs.pop(job_id)
-            # Only directories created by this process, never a user-supplied path.
+            # 仅删除本进程创建的任务目录，不使用用户提供的路径。
             shutil.rmtree(job['directory'], ignore_errors=True)
 
 
+# 服务接收请求前初始化并预热引擎；关闭时回收会话、工作线程及临时文件。
 @asynccontextmanager
 async def lifespan(app):
     global pool, live_pipeline
@@ -2175,6 +2204,7 @@ def update_job(job_id, **values):
         jobs[job_id].update(values, updated=time.time())
 
 
+# 后台处理上传文件；通过检查点协作取消任务，并统一更新成功、失败或取消状态。
 def run_media_job(job_id, kind, source, result, options):
     update_job(job_id, status='processing', stage='decoding')
     started = time.perf_counter()
@@ -2209,6 +2239,7 @@ def run_media_job(job_id, kind, source, result, options):
             pass
 
 
+# 验证参数并预留任务名额，将上传内容分块落盘后提交后台执行器。
 async def submit_media(kind, file, conf, engine, profile, output):
     if pool is None:
         raise HTTPException(503, '模型目录尚未初始化')
@@ -2229,7 +2260,7 @@ async def submit_media(kind, file, conf, engine, profile, output):
                             directory=str(directory), result=str(result), updated=time.time(), readers=0)
     options = dict(conf=conf, engine=engine, profile=profile, output=output)
     try:
-        # UploadFile is spooled by Starlette. Never read the entire video into RAM.
+        # UploadFile 由 Starlette 暂存；分块复制，避免将整个视频读入内存。
         def save_upload():
             with open(source, 'wb') as destination:
                 shutil.copyfileobj(file.file, destination, length=1024 * 1024)
@@ -2237,7 +2268,7 @@ async def submit_media(kind, file, conf, engine, profile, output):
         try:
             await asyncio.shield(save_task)
         except asyncio.CancelledError:
-            await save_task  # Do not delete files while the writer still uses them.
+            await save_task  # 等待写入完成后再清理，避免删除仍在使用的文件。
             raise
         if not source.stat().st_size:
             raise ValueError('上传文件为空')
@@ -2265,13 +2296,13 @@ async def engines():
 
 @app.post('/api/image', status_code=202)
 async def image_upload(file: UploadFile = File(...), conf: float = Form(.4),
-                       engine: str = Form('auto'), profile: str = Form('balanced')):
+                       engine: str = Form('auto'), profile: str = Form('detail')):
     return await submit_media('image', file, conf, engine, profile, 'original')
 
 
 @app.post('/api/video', status_code=202)
 async def video_upload(file: UploadFile = File(...), conf: float = Form(.4),
-                       engine: str = Form('auto'), profile: str = Form('balanced'),
+                       engine: str = Form('auto'), profile: str = Form('detail'),
                        output: str = Form('original')):
     return await submit_media('video', file, conf, engine, profile, output)
 
@@ -2304,6 +2335,7 @@ def release_result(job_id):
             jobs[job_id]['updated'] = time.time()
 
 
+# 增加结果读取计数，响应结束后由后台回调释放，防止下载期间被过期清理。
 @app.get('/api/jobs/{job_id}/result')
 async def job_result(job_id: str):
     with jobs_lock:
@@ -2323,12 +2355,14 @@ def process_live_frame(raw, config):
     return live_pipeline.process(raw, config)
 
 
+# 接收与推理解耦；每帧携带独立配置快照，连接结束时取消任务并释放排队帧。
 @app.websocket('/ws')
 async def realtime(websocket: WebSocket):
     await websocket.accept()
     await websocket.send_json(dict(type='init'))
-    # FIFO: never overwrite a received frame. A bounded queue propagates
-    # backpressure when inference cannot keep up with incoming JPEGs.
+    # 服务端按入队顺序处理已接收帧；浏览器采集与显示端仍可能跳过画面。
+    # 当推理速度跟不上输入时，
+    # 有界队列通过等待入队向接收端传递背压。
     pending_frames = asyncio.Queue(maxsize=4)
 
     async def receive_frames():
@@ -2371,13 +2405,13 @@ async def realtime(websocket: WebSocket):
                           server_process_ms=round((completed - started) * 1000, 2),
                           server_total_ms=round((completed - arrived) * 1000, 2),
                           queue_ms=round((started - arrived) * 1000, 2))
-            # Only this task sends inference results, so WebSocket writes stay ordered.
+            # 仅由此任务发送推理结果，保证 WebSocket 写入顺序。
             jpeg = result.pop('_jpeg', None)
             if jpeg is None:
                 await websocket.send_json(result)
             else:
-                # One atomic message: 4-byte big-endian metadata length, UTF-8
-                # metadata, then JPEG. A frame can never acquire another frame's boxes.
+                # 使用一条完整消息：4 字节大端元数据长度、UTF-8 元数据，
+                # 最后是 JPEG 数据，确保图像与本帧检测结果对应。
                 header = json.dumps(result, ensure_ascii=False).encode('utf-8')
                 await websocket.send_bytes(len(header).to_bytes(4, 'big') + header + jpeg)
 
@@ -2405,3 +2439,4 @@ async def realtime(websocket: WebSocket):
 if __name__ == '__main__':
     uvicorn.run(app, host='0.0.0.0', port=int(os.environ.get('PORT', '7860')),
                 ws_max_size=24 * 1024 * 1024, ws_max_queue=2, log_level='info')
+
