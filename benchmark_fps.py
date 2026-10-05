@@ -147,20 +147,22 @@ def summarize(times, speeds):
 
 # 打印 FPS 排行表；分辨率与输入尺寸同时给出，便于判断是否发生补边。
 def print_table(results):
-    print(f"\n{'=' * 96}")
+    width = 104
+    print(f"\n{'=' * width}")
     print('预测/画框 FPS 排行（不含解码、编码与传输）')
-    print(f"{'=' * 96}")
-    header = (f"{'引擎':<24}{'型号':<5}{'源画面':<12}{'输入':<12}"
-              f"{'平均ms':>9}{'FPS':>9}{'中位FPS':>9}{'推理ms':>9}{'后处理ms':>10}{'显存MB':>9}")
-    print(header)
-    print('-' * 96)
+    print(f"{'=' * width}")
+    print(f"{'引擎':<22}{'型号':<4}{'源画面':<10}{'输入':<10}"
+          f"{'平均ms':>8}{'预处理ms':>9}{'FPS':>8}{'中位FPS':>8}"
+          f"{'推理ms':>8}{'后处理ms':>9}{'显存MB':>8}")
+    print('-' * width)
     for item in sorted(results, key=lambda row: row['fps_mean'], reverse=True):
-        print(f"{item['key']:<24}{item['variant']:<5}"
-              f"{item['source_w']}x{item['source_h']:<8}"
-              f"{item['input_w']}x{item['input_h']:<8}"
-              f"{item['mean_ms']:>7.2f}  {item['fps_mean']:>7.1f}  {item['fps_median']:>7.1f}  "
-              f"{item['inference_ms']:>7.2f}  {item['postprocess_ms']:>8.2f}  "
-              f"{item['vram_peak_mb']:>7.1f}")
+        source = f"{item['source_w']}x{item['source_h']}"
+        net = f"{item['input_w']}x{item['input_h']}"
+        print(f"{item['key']:<22}{item['variant']:<4}{source:<10}{net:<10}"
+              f"{item['mean_ms']:>8.2f}{item['preprocess_ms']:>9.2f}"
+              f"{item['fps_mean']:>8.1f}{item['fps_median']:>8.1f}"
+              f"{item['inference_ms']:>8.2f}{item['postprocess_ms']:>9.2f}"
+              f"{item['vram_peak_mb']:>8.1f}")
 
 
 def main():
@@ -238,8 +240,10 @@ def main():
                              input_w=640, input_h=640, render=args.render,
                              vram_peak_mb=round(torch.cuda.max_memory_allocated(args.device) / 1048576, 1))
                 report['results'].append(stats)
+                drawing = f" · 画框 {stats['drawing_ms']:.2f} ms" if args.render == 'server' else ''
                 print(f"    {stats['rounds']} 轮 · {stats['mean_ms']:.2f} ms · {stats['fps_mean']:.1f} FPS · "
-                      f"画框 {stats['drawing_ms']:.2f} ms", flush=True)
+                      f"预处理 {stats['preprocess_ms']:.2f} / 推理 {stats['inference_ms']:.2f} / "
+                      f"后处理 {stats['postprocess_ms']:.2f} ms{drawing}", flush=True)
         except Exception as exc:
             report['results'].append(dict(key=item['key'], variant=item['variant'], error=str(exc)))
             print(f"    [失败] {exc}", flush=True)
