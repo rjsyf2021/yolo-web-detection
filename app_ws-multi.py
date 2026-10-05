@@ -6,6 +6,7 @@
 """共享 GPU 引擎池；文件处理与实时检测分别管理各自的输入、输出流水线。"""
 from pathlib import Path
 import gc
+import os
 import math
 import re
 import threading
@@ -16,12 +17,19 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 
+INFERENCE_SIZE = 640
 
-# 共享引擎池：通过同一把锁串行访问模型，使用最近最少使用策略管理缓存。
+
+# 实例池：管理锁只负责分配；每个实例独占使用，不同实例可并行预测。
 class EnginePool:
     def __init__(self, directory, cache_size=3):
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
+        self.available = threading.Condition(self.lock)
         self.cache = OrderedDict()
+        self.replica_limit = max(1, min(4, int(os.environ.get('ENGINE_REPLICAS', '2'))))
+        self.reserve_bytes = max(512, int(os.environ.get('GPU_RESERVE_MB', '2048'))) * 1024**2
+        self.replica_bytes = {}
+        self.parallel_disabled = False
         self.cache_size = max(1, cache_size)
         self.engines = {}
         for path in sorted(Path(directory).glob('*.engine')):
@@ -30,18 +38,18 @@ class EnginePool:
                 continue
             variant, width, height = match.groups()
             width, height = int(width), int(height)
-            if min(width, height) <= 0:
+            if (width, height) != (INFERENCE_SIZE, INFERENCE_SIZE):
                 continue
             # 从文件名读取标称宽×高，按 32 步长推定输入尺寸；此处未读取引擎内部形状。
             ih, iw = ((height + 31) // 32 * 32, (width + 31) // 32 * 32)
             self.engines[path.stem] = dict(
                 key=path.stem, path=str(path.resolve()), model=variant,
                 w=width, h=height, input_w=iw, input_h=ih,
-                label=f'YOLO26{variant} · {width}×{height}',
+                label=f'YOLO26{variant} · 推理 {width}×{height}',
             )
         if not self.engines:
             raise RuntimeError(f'在 {directory} 未找到引擎；请自备 YOLO26 n/s/m/l/x 检测引擎，'
-                               '按 yolo26m_1440x1080.engine 这类格式命名')
+                               '按 yolo26m_640x640.engine 这类格式命名')
         if not torch.cuda.is_available():
             raise RuntimeError('CUDA 不可用，请在 GPU 服务器的原 YOLO 环境中启动')
         print('[engine] 发现引擎:', ', '.join(self.engines), flush=True)
@@ -100,7 +108,7 @@ class EnginePool:
             # 为 NVDEC/NVENC 和并发文件处理预留显存，
             # 避免空闲模型上下文占满可用空间。
             torch.cuda.empty_cache()
-            while len(self.cache) > 1 and torch.cuda.mem_get_info()[0] < 1024**3:
+            while len(self.cache) > 1 and torch.cuda.mem_get_info()[0] < self.reserve_bytes:
                 evict_oldest()
         # 失败原因留在预热报告中；可用目录只保留预热成功项。
         # 已成功预热但因显存预算被逐出的模型仍可按需重新加载。
@@ -108,7 +116,10 @@ class EnginePool:
             self.engines.pop(key, None)
         if report['evicted']:
             self.cache_size = max(1, min(self.cache_size, len(self.cache)))
-        report.update(resident=list(self.cache), cache_limit=self.cache_size,
+        self.prepare_parallel()
+        report.update(replicas={key: len(slots) for key, slots in self.cache.items()},
+                      reserve_mb=self.reserve_bytes // 1024**2,
+                      resident=list(self.cache), cache_limit=self.cache_size,
                       elapsed=round(time.perf_counter()-started, 2))
         self.warmup_report = report
         print(f'[warmup] 启动预热结束: 成功 {len(report["warmed"])}/{report["total"]}, '
@@ -117,7 +128,122 @@ class EnginePool:
             raise RuntimeError('所有模型预热失败，请查看以上模型/显存/导出尺寸错误')
         return report
 
-    # 显式指定时直接返回该引擎；自动选择先匹配比例，再按策略比较目标分辨率。
+    def allocation_budget(self, engine):
+        # 使用真实设备空闲显存（包含 TensorRT 分配），并给测得常驻量留余量。
+        return max(512 * 1024**2, Path(engine['path']).stat().st_size * 3,
+                   int(self.replica_bytes.get(engine['key'], 0) * 1.5))
+
+    def new_replica(self, engine):
+        free_before, _ = torch.cuda.mem_get_info()
+        if free_before < self.reserve_bytes + self.allocation_budget(engine):
+            raise RuntimeError('显存预算不足（out of memory budget），保留编解码空间')
+        model = YOLO(engine['path'], task='detect')
+        stream = torch.cuda.Stream(device=0)
+        # 在接收请求之前完成加载、CUDA Graph 初始化和固定输入预热。
+        with torch.cuda.stream(stream):
+            model.predict(np.zeros((INFERENCE_SIZE, INFERENCE_SIZE, 3), dtype=np.uint8),
+                          imgsz=(INFERENCE_SIZE, INFERENCE_SIZE), rect=False, conf=.4,
+                          device=0, verbose=False, stream=False)
+        stream.synchronize()
+        free_after, _ = torch.cuda.mem_get_info()
+        self.replica_bytes[engine['key']] = max(self.replica_bytes.get(engine['key'], 0),
+                                                max(0, free_before - free_after))
+        return dict(model=model, stream=stream, busy=False)
+
+    def prepare_parallel(self):
+        # 只在启动阶段扩容，避免业务推理进行中触发额外模型的 CUDA Graph 捕获。
+        with self.available:
+            for key, slots in self.cache.items():
+                engine = self.engines[key]
+                while len(slots) < self.replica_limit:
+                    free, _ = torch.cuda.mem_get_info()
+                    if free < self.reserve_bytes + self.allocation_budget(engine):
+                        print(f'[engine] {key}: 显存预算不足，保留 {len(slots)} 个实例', flush=True)
+                        break
+                    try:
+                        slots.append(self.new_replica(engine))
+                        print(f'[engine] {key}: 已预热 {len(slots)} 个独立实例', flush=True)
+                    except Exception as exc:
+                        # 增设实例失败不影响已经可用的基础实例。
+                        print(f'[engine] {key}: 不再增设实例，使用现有实例: {exc}', flush=True)
+                        break
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    def acquire_replica(self, engine):
+        key = engine['key']
+        with self.available:
+            while True:
+                slots = self.cache.get(key)
+                if slots:
+                    if not self.parallel_disabled and torch.cuda.mem_get_info()[0] < self.reserve_bytes:
+                        self.disable_parallel()
+                    for index, slot in enumerate(slots):
+                        if slot['busy']:
+                            continue
+                        if index and (self.parallel_disabled or
+                                      torch.cuda.mem_get_info()[0] < self.reserve_bytes):
+                            continue
+                        slot['busy'] = True
+                        self.cache.move_to_end(key)
+                        return slot
+                    self.available.wait(.05)
+                    continue
+                # 缓存失效后只重建基础实例；等待本进程推理空闲再初始化 CUDA Graph。
+                if any(slot['busy'] for group in self.cache.values() for slot in group):
+                    self.available.wait(.05)
+                    continue
+                while self.cache and (len(self.cache) >= self.cache_size or
+                        torch.cuda.mem_get_info()[0] < self.reserve_bytes + self.allocation_budget(engine)):
+                    _, old = self.cache.popitem(last=False)
+                    del old
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                slot = self.new_replica(engine)
+                slot['busy'] = True
+                self.cache[key] = [slot]
+                return slot
+
+    def release_replica(self, key, slot, broken=False):
+        with self.available:
+            slot['busy'] = False
+            slots = self.cache.get(key, [])
+            if broken or (self.parallel_disabled and slots and slot is not slots[0]):
+                if slot in slots:
+                    slots.remove(slot)
+                if not slots:
+                    self.cache.pop(key, None)
+                slot['model'] = slot['stream'] = None
+            self.available.notify_all()
+
+    def disable_parallel(self):
+        with self.available:
+            self.parallel_disabled = True
+            for slots in self.cache.values():
+                slots[:] = [slot for index, slot in enumerate(slots) if index == 0 or slot['busy']]
+            self.available.notify_all()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def infer_replica(self, slot, bgr, engine, conf, need_cpu):
+        # GPU JPEG 张量由解码线程产生；本实例流显式等待生产流。
+        started = time.perf_counter()
+        try:
+            slot['stream'].wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(slot['stream']):
+                result = slot['model'].predict(
+                    bgr, imgsz=(engine['input_h'], engine['input_w']), rect=False,
+                    conf=conf, device=0, verbose=False, stream=False)[0]
+                if need_cpu:
+                    result = result.cpu()
+                packed = result.boxes.data.detach().cpu().numpy() if result.boxes is not None else None
+            slot['stream'].synchronize()
+            return result, packed, (time.perf_counter() - started) * 1000, None
+        except Exception as exc:
+            # 不把回溯带到 OOM 回退路径，以便释放失败推理的临时张量。
+            return None, None, 0., str(exc)
+
+    # 显式选择型号；自动策略只比较参数规模，所有引擎均为 640×640。
     def select(self, width, height, requested='auto', profile='balanced'):
         if min(width, height) <= 0:
             raise ValueError('媒体宽高无效')
@@ -130,31 +256,9 @@ class EnginePool:
                 raise ValueError('所选引擎不存在，请刷新引擎列表')
             return self.engines[requested]
 
-        # 优先减少等比例缩放后的填充面积；允许覆盖率相差 4 个百分点以容纳步长取整，
-        # 同时存在两种比例时，16:9 画面不会与 4:3 引擎并列为最佳比例。
-        candidates = []
-        for item in self.engines.values():
-            scale = min(item['input_w'] / width, item['input_h'] / height)
-            coverage = width * height * scale * scale / (item['input_w'] * item['input_h'])
-            candidates.append((item, scale, coverage))
-        best_coverage = max(c[2] for c in candidates)
-        candidates = [c for c in candidates if c[2] >= best_coverage - .04]
-        # 文件识别默认使用 detail，不设 1080p 上限；仍按原图大小选择，避免无意义放大。
-        cap = {'speed': 720, 'balanced': 1080, 'detail': float('inf')}[profile]
-        target_scale = min(1.0, cap / min(width, height))
-        # 比例与输入尺寸优先；尺寸匹配度相同时，再按策略选择模型规模。
-        # 型号顺序表达资源偏好，不代表在任意素材上都有相同的准确率排序。
-        model_order = {'speed': 'nsmlx', 'balanced': 'snmlx', 'detail': 'xlmsn'}[profile]
-        priority = {variant: index for index, variant in enumerate(model_order)}
-
-        def score(candidate):
-            item, scale, coverage = candidate
-            ratio = scale / target_scale
-            # 优先选择最接近目标的分辨率，并对不必要的放大增加惩罚。
-            distance = abs(math.log(ratio)) * (1.3 if ratio > 1 else 1.0)
-            return (distance + .15 * (best_coverage - coverage),
-                    priority[item['model']], item['input_w'] * item['input_h'], item['key'])
-        return min(candidates, key=score)[0]
+        # 采集和输出尺寸独立于网络输入；自动选择只决定模型规模。
+        order = {'speed': 'nsmlx', 'balanced': 'snmlx', 'detail': 'xlmsn'}[profile]
+        return min(self.engines.values(), key=lambda item: (order.index(item['model']), item['key']))
 
     # 支持 BGR 数组或已预处理张量；返回图像（延后画框时为 Results，否则可为 None）、检测列表及耗时。
     def predict(self, bgr, engine, conf=.4, annotate=False, defer_plot=False):
@@ -162,37 +266,23 @@ class EnginePool:
             raise ValueError('置信度必须在 0 到 1 之间')
         key = engine['key']
         wait_start = time.perf_counter()
-        with self.lock:
+        for attempt in range(2):
+            slot = self.acquire_replica(engine)
             wait_ms = (time.perf_counter() - wait_start) * 1000
-            if key not in self.cache:
-                if len(self.cache) >= self.cache_size:
-                    _, old = self.cache.popitem(last=False)
-                    del old
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                print(f'[engine] 首次加载 {key}', flush=True)
-                self.cache[key] = YOLO(engine['path'], task='detect')
-            model = self.cache[key]
-            self.cache.move_to_end(key)
-            started = time.perf_counter()
+            error = None
             try:
-                result = model.predict(
-                    bgr, imgsz=(engine['input_h'], engine['input_w']), rect=False,
-                    conf=conf, device=0, verbose=False, stream=False,
-                )[0]
-                if annotate or defer_plot:
-                    result = result.cpu()
-                # 实时 JSON 仅需传回紧凑的检测框数据表，
-                # 因此无需为每一帧复制完整的 Results 对象。
-                packed_boxes = (result.boxes.data.detach().cpu().numpy()
-                                if result.boxes is not None else None)
-            except Exception as exc:
-                self.cache.pop(key, None)
-                raise RuntimeError(
-                    f'{key} 推理失败（按文件名推定输入为 '
-                    f'{engine["input_w"]}×{engine["input_h"]}，请核对导出尺寸）: {exc}'
-                ) from exc
-            infer_ms = (time.perf_counter() - started) * 1000
+                result, packed_boxes, infer_ms, error = self.infer_replica(
+                    slot, bgr, engine, conf, annotate or defer_plot)
+            finally:
+                # infer_replica 将推理异常转为文本；总会归还实例。
+                self.release_replica(key, slot, broken=bool(error))
+            if error is None:
+                break
+            if attempt == 0 and any(word in error.lower() for word in
+                                   ('out of memory', 'outofmemory', 'cuda_error_out_of_memory')):
+                self.disable_parallel()
+                continue
+            raise RuntimeError(f'{key} 推理失败（输入 {engine["input_w"]}×{engine["input_h"]}）: {error}')
         # BGR 图像输入的检测框由 Ultralytics 映射回原图；张量输入另行还原坐标。
         detections = []
         if packed_boxes is not None:
@@ -241,6 +331,7 @@ def process_image(source, target, pool, options, progress):
     engine = pool.select(width, height, options['engine'], options['profile'])
     progress(stage='detecting', source_w=width, source_h=height, engine=engine['key'])
     annotated, dets, timing = pool.predict(image, engine, options['conf'], annotate=True)
+    options.get('check_cancel', lambda: None)()
     ok, encoded = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 95])
     if not ok:
         raise RuntimeError('图片编码失败')
@@ -270,12 +361,8 @@ def oriented_bgr(frame, stream):
 
 # 返回绘制尺寸和编码尺寸；两者的差异仅用于满足编码器的偶数宽高要求。
 def output_size(width, height, engine, mode):
-    if mode == 'nearest':
-        # 保持源画面宽高比，缩小至选定引擎分辨率内，不放大原图。
-        scale = min(1., engine['input_w'] / width, engine['input_h'] / height)
-        width, height = max(2, round(width * scale)), max(2, round(height * scale))
-    elif mode != 'original':
-        raise ValueError('无效的输出尺寸模式')
+    if mode != 'original':
+        raise ValueError('文件结果仅支持原始分辨率')
     # H.264 的 yuv420p 格式要求宽高为偶数：每个方向最多补一像素边缘。
     return width, height, width + width % 2, height + height % 2
 
@@ -416,15 +503,7 @@ def process_video(source, target, pool, options, progress):
         height, width = first_image.shape[:2]
         engine = pool.select(width, height, options['engine'], options['profile'])
         draw_w, draw_h, out_w, out_h = output_size(width, height, engine, options['output'])
-        progress(stage='warming', engine=engine['key'], frames=0)
-        warmup_started = time.perf_counter()
-        warm_image = (cv2.resize(first_image, (draw_w, draw_h), interpolation=cv2.INTER_AREA)
-                      if (draw_w, draw_h) != (width, height) else first_image)
-        for _ in range(5):
-            options.get('check_cancel', lambda: None)()
-            pool.predict(warm_image, engine, options['conf'], annotate=False)
-        warmup_ms = (time.perf_counter() - warmup_started) * 1000
-        del warm_image
+        warmup_ms = 0.
         time_base = stream.time_base or Fraction(1, 90000)
         origin = (first.pts * first.time_base) if first.pts is not None else Fraction(0)
         # 帧缺少时间戳时按帧率补算时长，并在结果中标记为 fallback。
@@ -461,8 +540,6 @@ def process_video(source, target, pool, options, progress):
                 image = oriented_bgr(frame, stream) if image is None else image
                 if image.shape[:2] != (height, width):
                     raise ValueError('视频中途改变了分辨率，暂不支持这种文件')
-                if (draw_w, draw_h) != (width, height):
-                    image = cv2.resize(image, (draw_w, draw_h), interpolation=cv2.INTER_AREA)
                 cpu_result, _, timing = pool.predict(image, engine, options['conf'], defer_plot=True)
                 drawn = draw_worker.submit(draw_frame, cpu_result)
                 encode_pending.append(encode_worker.submit(write_frame, drawn, pts, duration, timing))
@@ -474,7 +551,7 @@ def process_video(source, target, pool, options, progress):
                 options.get('check_cancel', lambda: None)()
                 draw_started = time.perf_counter()
                 annotated = cpu_result.plot()
-                if annotated.shape[:2] != (draw_h, draw_w):
+                if annotated.shape[:2] != (height, width):
                     raise RuntimeError('画框输出尺寸不一致')
                 if (out_w, out_h) != (draw_w, draw_h):
                     annotated = cv2.copyMakeBorder(annotated, 0, out_h - draw_h,
@@ -534,10 +611,25 @@ def process_video(source, target, pool, options, progress):
                    '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy',
                    '-c:a', 'aac', '-b:a', '192k', '-t', str(duration_seconds),
                    '-map_metadata', '-1', '-movflags', '+faststart', str(target)]
-        completed = subprocess.run(command, capture_output=True, text=True,
-                                   encoding='utf-8', errors='replace', timeout=3600)
-        if completed.returncode:
-            raise RuntimeError('视频音轨合成失败: ' + completed.stderr[-1500:])
+        with subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                              text=True, encoding='utf-8', errors='replace') as muxer:
+            deadline = time.monotonic() + 3600
+            try:
+                while True:
+                    options.get('check_cancel', lambda: None)()
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError('视频音轨合成超时')
+                    try:
+                        _, stderr = muxer.communicate(timeout=.25)
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+                if muxer.returncode:
+                    raise RuntimeError('视频音轨合成失败: ' + stderr[-1500:])
+            finally:
+                if muxer.poll() is None:
+                    muxer.kill()
+                    muxer.communicate()
         os.unlink(intermediate)
     else:
         os.replace(intermediate, target)
@@ -550,7 +642,7 @@ def process_video(source, target, pool, options, progress):
                 draw_ms=round(draw_total / max(count, 1), 2), encode_ms=round(encode_total / max(count, 1), 2),
                 timing='fallback' if timing_fallback else 'source_pts', audio=has_audio,
                 processing_fps=round(count / max(processing_elapsed, .001), 2),
-                warmup_ms=round(warmup_ms, 2), warmup_runs=5,
+                warmup_ms=round(warmup_ms, 2), warmup_runs=0,
                 processing_seconds=round(processing_elapsed, 3),
                 infer_ms=round(infer_total / max(count, 1), 2), elapsed=round(elapsed, 2))
 
@@ -579,6 +671,23 @@ class RealtimePipeline:
         self.warned = False
         self.retry_decoder_after = 0.
 
+    def decode_rgb(self, raw):
+        # 调用方持有解码锁，直到输入张量完成转换/复制，避免复用解码缓冲。
+        if self.decoder is None:
+            self.decoder = nvimgcodec.Decoder()
+        decoded = self.decoder.decode(raw)
+        tensor = torch.from_dlpack(decoded.cuda())
+        if tensor.ndim != 3:
+            raise ValueError('解码张量维数不支持')
+        if tensor.shape[-1] == 3:
+            height, width = tensor.shape[:2]
+            tensor = tensor.permute(2, 0, 1)
+        elif tensor.shape[0] == 3:
+            height, width = tensor.shape[1:]
+        else:
+            raise ValueError('解码结果不是三通道 RGB')
+        return tensor, int(width), int(height)
+
     # GPU 解码失败后进入 30 秒冷却期，期间使用 OpenCV，避免每帧重复初始化失败。
     @torch.inference_mode()
     def process(self, raw, config):
@@ -586,7 +695,22 @@ class RealtimePipeline:
             raise ValueError('实时 JPEG 过大，请降低采集分辨率或质量')
         if config.get('render') == 'server':
             started = time.perf_counter()
-            image = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+            image = None
+            decoder_name = 'OpenCV CPU'
+            if nvimgcodec is not None and time.monotonic() >= self.retry_decoder_after:
+                try:
+                    with self.decode_lock:
+                        rgb, _, _ = self.decode_rgb(raw)
+                        # 服务器画框需原图；先 GPU 解码，再仅复制一次原始字节图到 CPU。
+                        image = cv2.cvtColor(rgb.permute(1, 2, 0).cpu().numpy(), cv2.COLOR_RGB2BGR)
+                        decoder_name = 'nvImageCodec → CPU BGR'
+                except Exception as exc:
+                    self.retry_decoder_after = time.monotonic() + 30
+                    if not self.warned:
+                        print(f'[realtime] GPU 解码不可用，回退 OpenCV: {exc}', flush=True)
+                        self.warned = True
+            if image is None:
+                image = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
             if image is None:
                 raise ValueError('实时 JPEG 解码失败')
             height, width = image.shape[:2]
@@ -598,7 +722,7 @@ class RealtimePipeline:
             if not ok:
                 raise RuntimeError('服务器实时 JPEG 编码失败')
             return dict(type='result', id=config.get('id'), render='server', dets=[],
-                        width=width, height=height, engine=engine['key'], decoder='OpenCV CPU',
+                        width=width, height=height, engine=engine['key'], decoder=decoder_name,
                         decode_ms=round(decode_ms, 2), server_draw_ms=timing['draw_ms'],
                         server_encode_ms=round((time.perf_counter()-encode_started)*1000, 2),
                         return_bytes=int(jpeg.size), _jpeg=jpeg.tobytes(), **timing)
@@ -608,25 +732,14 @@ class RealtimePipeline:
         if nvimgcodec is not None and time.monotonic() >= self.retry_decoder_after:
             try:
                 with self.decode_lock:
-                    if self.decoder is None:
-                        self.decoder = nvimgcodec.Decoder()
-                    decoded = self.decoder.decode(raw)
-                    tensor = torch.from_dlpack(decoded.cuda())
-                    if tensor.ndim != 3:
-                        raise ValueError('解码张量维数不支持')
-                    if tensor.shape[-1] == 3:
-                        height, width = tensor.shape[:2]
-                        tensor = tensor.permute(2, 0, 1)
-                    elif tensor.shape[0] == 3:
-                        height, width = tensor.shape[1:]
-                    else:
-                        raise ValueError('解码结果不是三通道 RGB')
+                    tensor, width, height = self.decode_rgb(raw)
                     width, height = int(width), int(height)
                     engine = self.pool.select(width, height, config.get('engine', 'auto'), 'balanced')
                     ih, iw = engine['input_h'], engine['input_w']
                     scale = min(iw / width, ih / height)
                     resized_w, resized_h = max(1, round(width * scale)), max(1, round(height * scale))
-                    left, top = (iw - resized_w) // 2, (ih - resized_h) // 2
+                    left = round((iw - resized_w) / 2 - .1)
+                    top = round((ih - resized_h) / 2 - .1)
                     padding = (left, iw - resized_w - left, top, ih - resized_h - top)
                     if (resized_h, resized_w) != (height, width):
                         tensor = tensor.to(device='cuda:0', dtype=torch.float32,
@@ -666,7 +779,8 @@ class RealtimePipeline:
         _, detections, timing = self.pool.predict(input_image, engine, float(config.get('conf', .4)))
         if tensor is not None:
             # 张量输入返回补边后引擎坐标系中的检测框，需逆向消除补边与缩放。
-            sx, sy = resized_w / width, resized_h / height
+            # 与 Ultralytics scale_boxes 使用同一等比例缩放系数。
+            sx = sy = scale
             for detection in detections:
                 x1, y1, x2, y2 = detection['box']
                 detection['box'] = [max(0., min(float(width), (x1 - left) / sx)),
@@ -800,8 +914,8 @@ def install_webrtc(app, get_pool):
         if not math.isfinite(conf) or not 0 <= conf <= 1:
             raise ValueError('无效置信度')
         width, height = int(value['width']), int(value['height'])
-        e = get_pool().engines[engine]
-        if min(width, height) < 16 or width * height > e['input_w'] * e['input_h'] * 1.1:
+        # 摄像头画幅与网络输入无关，允许最高 1080p 及横竖屏。
+        if min(width, height) < 16 or max(width, height) > 1920 or min(width, height) > 1080:
             raise ValueError('无效画面尺寸')
         render = value.get('render', 'client')
         if render not in ('client', 'server'):
@@ -947,6 +1061,8 @@ def install_webrtc(app, get_pool):
                     container.close()
 
     def detect(image, config, session, stamp):
+        if session.get('prepare_future') is not None:
+            session['prepare_future'].result()
         # 与 JPEG 一样等比例容纳完整画面，不裁剪、拉伸或自行推断旋转方向。
         height, width = image.shape[:2]
         w, h = config['width'], config['height']
@@ -995,27 +1111,20 @@ def install_webrtc(app, get_pool):
         url = whip_base + '/' + session['path'] + '/whip'
         try:
             # 在媒体帧到达前创建推理与编码线程，
-            # 将 CUDA 初始化、预热及所有编码调用固定到该线程。
+            # 将该连接的帧处理及所有编码调用固定到该线程。
             session['executor'] = ThreadPoolExecutor(max_workers=1, thread_name_prefix='rtc-process')
             session['publisher'] = AnnotatedRTSPPublisher(rtsp_base, session['path'])
-            def warmup():
+            # 固定 640×640 模型已在启动时预热。编码器准备与 WHIP 信令并行，
+            # 同一执行器保证首帧处理排在编码器准备之后。
+            def prepare_output():
                 started = time.perf_counter()
-                image = np.zeros((config['height'], config['width'], 3), dtype=np.uint8)
-                engine = get_pool().select(config['width'], config['height'], config['engine'])
-                for _ in range(5):
-                    if session['stop'].is_set():
-                        raise RuntimeError('实时会话已停止')
-                    get_pool().predict(image, engine, config['conf'], annotate=config['render']=='server')
-                model_ms = round((time.perf_counter()-started)*1000, 2)
                 if config['render'] == 'server' and not session['stop'].is_set():
                     session['publisher'].open(config['width']+config['width']%2,
                                               config['height']+config['height']%2, config['bitrate'], config['fps'])
-                return model_ms
-            # 先预热实际使用的处理路径，再协商发布连接，
-            # 避免模型首次加载期间积压输入帧。
-            session['warmup_ms'] = await asyncio.wrap_future(session['executor'].submit(warmup))
-            if session['closing']:
-                raise RuntimeError('实时会话已关闭')
+                session['output_prepare_ms'] = round((time.perf_counter()-started)*1000, 2)
+            session['warmup_ms'] = 0.
+            session['prepare_future'] = session['executor'].submit(prepare_output)
+            signaling_started = time.perf_counter()
             exchange = asyncio.create_task(asyncio.to_thread(http_request, url, 'POST', sdp.encode()))
             try:
                 answer, location = await asyncio.shield(exchange)
@@ -1031,7 +1140,8 @@ def install_webrtc(app, get_pool):
             session['location'] = location
             session['initializing'] = False
             session['last_seen'] = time.monotonic()
-            return dict(type='answer', sdp=answer, session_id=sid, warmup_ms=session['warmup_ms'])
+            session['whip_ms'] = round((time.perf_counter()-signaling_started)*1000, 2)
+            return dict(type='answer', sdp=answer, session_id=sid, warmup_ms=0., whip_ms=session['whip_ms'])
         except BaseException as exc:
             await close_session(session)
             if isinstance(exc, asyncio.CancelledError):
@@ -1090,6 +1200,7 @@ def install_webrtc(app, get_pool):
                 result.update(id=count, convert_ms=round(convert_ms, 2), decoder=decoder,
                               fallback=fallback, pending=session['frames'].qsize(),
                               queue_capacity=session['frames'].maxsize, warmup_ms=session['warmup_ms'],
+                              output_prepare_ms=session.get('output_prepare_ms'), whip_ms=session.get('whip_ms'),
                               decoder_startup_ms=session['decoder_startup_ms'], decoded=session['decoded'],
                               replaced=session['replaced'], queue_policy=config['queue_policy'],
                               server_ms=round((time.perf_counter()-arrived)*1000, 2),
@@ -1224,17 +1335,16 @@ HTML = r'''
 <section id="mediaSection">
  <div class="controls">
   <input id="file" type="file" accept="image/*,video/*" multiple>
-  <label>引擎<select id="mediaEngine"><option value="auto">自动匹配比例与分辨率</option></select></label>
-  <label>策略<select id="profile"><option value="detail" selected>细节 · 接近原图 / 同尺寸优先大模型</option><option value="balanced">均衡 · 1080p / 同尺寸优先 s</option><option value="speed">速度 · 720p / 同尺寸优先 n</option></select></label>
-  <label>视频输出<select id="output"><option value="original">保留原始分辨率</option><option value="nearest">适配引擎分辨率（保持比例）</option></select></label>
+  <label>引擎<select id="mediaEngine"><option value="auto">自动选择模型规模</option></select></label>
+  <label>策略<select id="profile"><option value="detail" selected>细节 · 优先大模型</option><option value="balanced">均衡 · 优先 s</option><option value="speed">速度 · 优先 n</option></select></label>
   <label>置信度<input id="mediaConfSlider" aria-label="图片视频置信度滑块" type="range" min="0" max="1" step=".01" value=".40"><input id="mediaConf" aria-label="图片视频置信度数值" type="number" min="0" max="1" step=".01" value=".40"></label>
   <label>同时处理<select id="mediaParallel"><option value="1">1 项</option><option value="2">2 项</option><option value="3" selected>3 项</option><option value="4">4 项</option></select></label>
   <button id="detect" class="primary">批量上传并检测</button>
   <button id="clearQueue" disabled>清空全部记录</button>
   <button id="stopTask" disabled>停止所有进行中任务</button>
  </div>
- <div class="hint">支持混合多选图片和视频，再次选择可追加。可同时处理 1 或 2 项；每项可单独预览和下载。并发提高整体吞吐，单个视频的 FPS 可能降低。停止按钮暂停后续队列并停止所有进行中任务。</div>
- <div class="hint">默认按原图尺寸自动匹配现有模型，支持高于 1080p 的引擎；也可手动选择。高分辨率需要更多显存，处理大图或高分辨率视频时建议同时处理 1 项。</div>
+ <div class="hint">支持混合多选图片和视频，再次选择可追加。可同时处理 1–4 项；每项可单独取消、重新开始、预览和下载。并发提高整体吞吐，单个视频的 FPS 可能降低。停止按钮暂停后续队列并停止所有进行中任务。</div>
+ <div class="hint">模型输入固定 640×640，LetterBox 等比例缩放补灰边；检测框还原到原图后画框。文件结果保持原始分辨率，不拉伸为正方形。任务结束后原文件和结果保留 15 分钟，查看与下载不续期；单项删除会清理该任务的历次重启文件。</div>
  <div id="batchStatus" class="status" role="status"></div>
  <div id="batchList"></div>
  <div id="mediaStatus" class="status" role="status">请选择图片或视频。</div><progress id="progress" max="100" value="0" hidden></progress>
@@ -1250,12 +1360,13 @@ HTML = r'''
   <label>传输<select id="liveTransport"><option value="jpeg">JPEG（原通道）</option><option value="webrtc">WebRTC（MediaMTX）</option></select></label>
   <label>画框位置<select id="liveRender"><option value="client" selected>客户端画框</option><option value="server">服务器画框（同帧）</option></select></label>
   <label>WebRTC 队列<select id="rtcQueue"><option value="fifo" selected>顺序处理（保留待处理帧）</option><option value="latest">低延迟（丢弃待处理旧帧）</option></select></label>
-  <label>WebRTC目标帧率<select id="rtcFps"><option value="10">10 FPS</option><option value="15">15 FPS</option><option value="20">20 FPS</option><option value="24">24 FPS</option><option value="25">25 FPS</option><option value="30">30 FPS</option><option value="40">40 FPS</option><option value="45">45 FPS</option><option value="50">50 FPS</option><option value="60" selected>60 FPS</option></select></label>
+  <label>摄像头目标帧率<select id="rtcFps"><option value="10">10 FPS</option><option value="15">15 FPS</option><option value="20">20 FPS</option><option value="24">24 FPS</option><option value="25">25 FPS</option><option value="30">30 FPS</option><option value="40">40 FPS</option><option value="45">45 FPS</option><option value="50">50 FPS</option><option value="60" selected>60 FPS</option></select></label>
   <label>WebRTC码率上限<select id="rtcBitrate"><option value="500000">0.5 Mbps</option><option value="1000000">1 Mbps</option><option value="1500000">1.5 Mbps</option><option value="2000000">2 Mbps</option><option value="3000000">3 Mbps</option><option value="4000000">4 Mbps</option><option value="6000000">6 Mbps</option><option value="8000000" selected>8 Mbps</option><option value="10000000">10 Mbps</option><option value="12000000">12 Mbps</option><option value="16000000">16 Mbps</option><option value="20000000">20 Mbps</option><option value="25000000">25 Mbps</option><option value="30000000">30 Mbps</option><option value="40000000">40 Mbps</option><option value="50000000">50 Mbps</option></select></label>
   <span class="hint">分辨率优先；码率是上限，实际帧率受设备与带宽限制。服务器画框回传使用同一档码率目标。</span>
   <label>横竖自适应<select id="liveAspect"><option value="4:3">4:3 / 3:4</option><option value="16:9">16:9 / 9:16</option></select></label>
   <label>画幅方向<select id="liveOrientation"><option value="auto">自动</option><option value="landscape">横屏</option><option value="portrait">竖屏</option></select></label>
-  <label>分辨率 / 模型<select id="liveEngine"><option value="">正在读取现有模型…</option></select></label>
+  <label>摄像头分辨率<select id="liveResolution"><option value="1080" selected>1080p</option><option value="720">720p</option></select></label>
+  <label>检测模型<select id="liveEngine"><option value="">正在读取现有模型…</option></select></label>
   <label>JPEG 质量<input id="quality" type="range" min=".65" max=".98" step=".01" value=".90"><span id="qualityValue">90%</span></label>
   <label>JPEG 编码<select id="jpegMode"><option value="compatible">兼容编码</option><option value="worker">后台编码（试用）</option></select></label>
   <label>发送缓冲<select id="bufferMode"><option value="compatible">兼容 512KB</option><option value="adaptive">低积压</option></select></label>
@@ -1287,11 +1398,9 @@ function kindOf(file){if(file.type.startsWith('image/')||/\.(jpe?g|png|webp|bmp|
 async function jsonResponse(response){let value;try{value=await response.json();}catch{throw new Error(`服务器响应异常（HTTP ${response.status}）`);}if(!response.ok)throw new Error(typeof value.detail==='string'?value.detail:JSON.stringify(value.detail||value));return value;}
 async function loadEngines(){
  const data=await jsonResponse(await fetch('/api/engines'));catalog=data.engines;
- // 文件识别展示全部已发现引擎，按标称像素数降序排列，便于选择高分辨率。
- const mediaEngines=[...catalog].sort((a,b)=>b.w*b.h-a.w*a.h||a.key.localeCompare(b.key));
+ // 画幅与模型尺寸独立，列表仅用于选择检测型号。
+ const mediaEngines=[...catalog].sort((a,b)=>'nsmlx'.indexOf(a.model)-'nsmlx'.indexOf(b.model));
  for(const engine of mediaEngines){const option=document.createElement('option');option.value=engine.key;option.textContent=engine.label;$('mediaEngine').appendChild(option);}
- for(const option of $('liveAspect').options)option.disabled=!enginesForAspect(option.value).length;
- if(!enginesForAspect($('liveAspect').value).length){const available=[...$('liveAspect').options].find(o=>!o.disabled);if(available)$('liveAspect').value=available.value;}
  refreshLiveEngines();
 }
 loadEngines().catch(e=>message('mediaStatus','引擎列表加载失败：'+e.message));
@@ -1306,22 +1415,12 @@ function videoHardwareInfo(m){
  if(m.video_pipeline)text+='\n'+m.video_pipeline;
  return text;
 }
-let mediaItems=[],previewItem=null;
-let mediaGeneration=0,mediaPoll=null;
+let mediaItems=[],previewItem=null,mediaGeneration=0,mediaRunning=0;
 const mediaUploads=new Set(),activeMediaJobs=new Set();
-let stopBatch=false;
 async function stopMediaJobs(ids){
  const outcomes=await Promise.allSettled(ids.map(id=>fetch('/api/jobs/'+id+'/stop',{method:'POST',keepalive:true}).then(jsonResponse)));
  return outcomes.filter(result=>result.status==='rejected');
 }
-$('stopTask').onclick=async()=>{
- if(!mediaBusy)return;
- const generation=mediaGeneration;stopBatch=true;$('stopTask').disabled=true;
- message('batchStatus','正在停止所有进行中的任务；尚在上传的项目会在上传完成后立即请求停止。');
- const failed=await stopMediaJobs([...activeMediaJobs]);
- if(generation===mediaGeneration&&failed.length){message('batchStatus','部分停止请求失败，请重试。');$('stopTask').disabled=false;}
-};
-const mediaControlIds=['file','detect','mediaEngine','profile','output','mediaConf','mediaConfSlider','mediaParallel'];
 function showMediaItem(item){
  previewItem=item;selectedFile=item.file;
  for(const id of ['sourceVideo','resultVideo']){const el=$(id);el.pause();el.removeAttribute('src');el.load();el.hidden=true;}
@@ -1344,135 +1443,191 @@ function setMediaDetail(item,text){
 }
 function updateBatchStatus(){
  const count=state=>mediaItems.filter(item=>item.state===state).length;
- $('clearQueue').disabled=mediaItems.length===0;
- message('batchStatus',`共 ${mediaItems.length} 项 · 完成 ${count('done')} · 失败 ${count('error')} · 待处理 ${count('pending')}${mediaBusy?' · 并行处理中':''}`);
+ mediaBusy=mediaRunning>0;
+ $('clearQueue').disabled=!mediaItems.length;
+ $('stopTask').disabled=!mediaItems.some(item=>['pending','uploading','processing'].includes(item.state));
+ $('progress').hidden=!mediaBusy;
+ for(const item of mediaItems){
+  const active=['uploading','processing'].includes(item.state);
+  item.stopNode.hidden=!item.kind||!['pending','uploading','processing'].includes(item.state);
+  item.stopNode.disabled=!!item.cancelRequested;
+  item.retryNode.hidden=!item.kind||!['done','error','stopped'].includes(item.state);
+  item.retryNode.disabled=active;
+ }
+ message('batchStatus',`共 ${mediaItems.length} 项 · 完成 ${count('done')} · 失败 ${count('error')} · 已取消 ${count('stopped')} · 待处理 ${count('pending')} · 进行中 ${mediaRunning}`);
 }
+async function cancelMediaItem(item){
+ if(!['pending','uploading','processing'].includes(item.state))return;
+ const generation=mediaGeneration;
+ item.cancelRequested=true;
+ if(item.state==='pending'){item.state='stopped';setMediaDetail(item,'已取消，可单独重新开始');}
+ else{
+  setMediaDetail(item,item.jobId?'正在取消当前任务…':'正在取消；上传返回任务编号后立即停止服务器处理…');
+  if(item.jobId){
+   const failed=await stopMediaJobs([item.jobId]);
+   if(generation!==mediaGeneration)return;
+   if(failed.length){item.cancelRequested=false;setMediaDetail(item,'取消请求失败，请再点一次取消');}
+  }
+ }
+ updateBatchStatus();
+}
+$('stopTask').onclick=()=>Promise.all(mediaItems.map(cancelMediaItem));
 $('clearQueue').onclick=()=>{
  mediaGeneration++;
- $('stopTask').disabled=true;
- const oldJobs=[...activeMediaJobs];activeMediaJobs.clear();
- void stopMediaJobs(oldJobs).then(failed=>{if(failed.length)console.warn('部分已清空任务停止失败',failed);});
- for(const xhr of mediaUploads)xhr.abort();mediaUploads.clear();
- if(mediaPoll){mediaPoll.abort();mediaPoll=null;}
- for(const item of mediaItems)item.state='removed';
- mediaItems=[];$('batchList').replaceChildren();previewItem=null;selectedFile=null;
- mediaBusy=false;for(const id of mediaControlIds)$(id).disabled=false;
- $('file').value='';$('progress').hidden=true;$('progress').value=0;
+ for(const item of mediaItems){const id=item.jobId||item.previousId;if(id)void deleteServerJob(id);}
+ activeMediaJobs.clear();
+ // 上传继续等到返回任务编号后停止，避免中止请求却遗留未知的服务器任务。
+ for(const item of mediaItems){item.cancelRequested=true;item.controller?.abort();}
+ mediaItems=[];mediaRunning=0;mediaBusy=false;
+ $('batchList').replaceChildren();previewItem=null;selectedFile=null;
+ $('file').value='';$('progress').value=0;
  for(const id of ['sourceVideo','resultVideo']){const el=$(id);el.pause();el.removeAttribute('src');el.load();el.hidden=true;}
  for(const id of ['sourceImage','resultImage']){$(id).removeAttribute('src');$(id).hidden=true;}
  if(sourceURL){URL.revokeObjectURL(sourceURL);sourceURL=null;}
  $('download').hidden=true;$('download').removeAttribute('href');
- message('mediaStatus','全部记录已清空，已向已知的后台任务发送停止请求。');
- updateBatchStatus();
+ message('mediaStatus','记录已清空，正在取消并删除原队列的服务器文件。');updateBatchStatus();
 };
+async function deleteServerJob(id){
+ try{await jsonResponse(await fetch('/api/jobs/'+id,{method:'DELETE',keepalive:true}));return true;}
+ catch(error){message('mediaStatus','服务器删除请求失败：'+error.message+'；文件仍按 15 分钟保留规则清理。');return false;}
+}
+async function deleteMediaItem(item){
+ // 删除前先提交服务器请求；失败时保留记录以便用户重试。
+ const id=item.jobId||item.previousId;
+ if(id&&!await deleteServerJob(id))return;
+ item.removed=true;item.cancelRequested=true;item.controller?.abort();
+ mediaItems=mediaItems.filter(value=>value!==item);item.row.remove();
+ if(previewItem===item){
+  previewItem=null;selectedFile=null;
+  for(const name of ['sourceVideo','resultVideo']){const element=$(name);element.pause();element.removeAttribute('src');element.load();element.hidden=true;}
+  for(const name of ['sourceImage','resultImage']){$(name).removeAttribute('src');$(name).hidden=true;}
+  if(sourceURL){URL.revokeObjectURL(sourceURL);sourceURL=null;}
+  $('download').hidden=true;
+  message('mediaStatus','已移除记录；服务器将在当前处理或下载结束后删除该任务及历次重启文件。');
+ }
+ // 删除仅更新列表；已启动任务结束时会自行补充原队列，不由删除操作启动处理。
+ updateBatchStatus();
+}
 $('file').onchange=()=>{
- if(mediaBusy)return;
  let first=null;
  for(const file of $('file').files){
-  const item={file,kind:null,state:'pending',detail:'等待上传'};
+  const item={file,kind:null,state:'pending',ready:mediaBusy,detail:'等待处理',cancelRequested:false,jobId:null,settings:null};
   try{item.kind=kindOf(file);}catch(error){item.state='error';item.detail=error.message;}
-  const row=document.createElement('section');row.className='batch-item';
-  item.row=row;
+  const row=document.createElement('section');row.className='batch-item';item.row=row;
   const name=document.createElement('strong');name.textContent=file.name+' · '+(file.size/1048576).toFixed(1)+' MB';
   item.statusNode=document.createElement('div');item.statusNode.className='batch-detail';item.statusNode.textContent=item.detail;
   const preview=document.createElement('button');preview.textContent='预览';preview.onclick=()=>showMediaItem(item);
   const download=document.createElement('a');download.className='download';download.textContent='下载检测结果';download.hidden=true;item.downloadNode=download;
-  const retry=document.createElement('button');retry.textContent='重新排队';retry.hidden=item.state!=='error'||!item.kind;item.retryNode=retry;
-  retry.onclick=()=>{if(mediaBusy)return;item.state='pending';retry.hidden=true;setMediaDetail(item,'等待上传');updateBatchStatus();};
-  row.append(name,item.statusNode,preview,retry,download);$('batchList').appendChild(row);
+  const cancel=document.createElement('button');cancel.textContent='取消此任务';cancel.onclick=()=>void cancelMediaItem(item);item.stopNode=cancel;
+  const retry=document.createElement('button');retry.textContent='重新开始';item.retryNode=retry;
+  retry.onclick=()=>{
+   if(!['done','error','stopped'].includes(item.state))return;
+   // 点击时保存新条件，排队期间再调整页面不会改变这次重启的参数。
+   try{item.settings=currentMediaSettings();}catch(error){setMediaDetail(item,error.message);return;}
+   item.state='pending';item.ready=true;item.cancelRequested=false;item.url=null;item.downloadNode.hidden=true;
+   setMediaDetail(item,'等待重新处理（使用当前选择的模型、策略和置信度）');
+   if(previewItem===item)showMediaItem(item);
+   pumpMediaQueue();
+  };
+  const remove=document.createElement('button');remove.textContent='删除文件与记录';remove.onclick=()=>void deleteMediaItem(item);
+  row.append(name,item.statusNode,preview,cancel,retry,remove,download);$('batchList').appendChild(row);
   mediaItems.push(item);first??=item;
  }
- $('file').value='';
- if(first)showMediaItem(first);
- updateBatchStatus();
+ $('file').value='';if(first)showMediaItem(first);updateBatchStatus();
+ if(mediaBusy)pumpMediaQueue();
 };
 function uploadMediaItem(item,form,generation){
  return new Promise((resolve,reject)=>{
   const xhr=new XMLHttpRequest();xhr.open('POST','/api/'+item.kind);xhr.responseType='json';
   mediaUploads.add(xhr);xhr.onloadend=()=>mediaUploads.delete(xhr);
-  xhr.upload.onprogress=e=>{if(generation===mediaGeneration&&e.lengthComputable){const percent=Math.round(100*e.loaded/e.total);if(previewItem===item)$('progress').value=percent;setMediaDetail(item,`上传中 ${percent}%`);}};
+  xhr.upload.onprogress=e=>{if(generation===mediaGeneration&&e.lengthComputable&&!item.cancelRequested){const percent=Math.round(100*e.loaded/e.total);if(previewItem===item)$('progress').value=percent;setMediaDetail(item,`上传中 ${percent}%`);}};
   xhr.onload=()=>{if(xhr.status>=200&&xhr.status<300&&xhr.response?.job_id)resolve(xhr.response);else reject(new Error(typeof xhr.response?.detail==='string'?xhr.response.detail:`上传失败（HTTP ${xhr.status}）`));};
   xhr.onerror=()=>reject(new Error('上传连接中断'));xhr.onabort=()=>reject(new Error('上传已中止'));xhr.send(form);
  });
 }
-$('detect').onclick=async()=>{
- if(mediaBusy)return;
- const batch=mediaItems.filter(item=>item.state==='pending');
- if(!batch.length){message('batchStatus','请先选择文件，或将失败项重新排队。');return;}
- let settings;
- try{settings={conf:confidence('mediaConf'),engine:$('mediaEngine').value,profile:$('profile').value,output:$('output').value};}
- catch(error){message('batchStatus',error.message);return;}
- const generation=++mediaGeneration;
- stopBatch=false;activeMediaJobs.clear();$('stopTask').disabled=false;
- const controller=new AbortController();mediaPoll=controller;
- mediaBusy=true;for(const id of mediaControlIds)$(id).disabled=true;
- for(const item of mediaItems)item.retryNode.disabled=true;
- $('progress').hidden=false;updateBatchStatus();
- let cursor=0;
- const parallel=Math.max(1,Math.min(4,Number($('mediaParallel').value)||3));
- async function worker(){
-  while(cursor<batch.length){
-   const item=batch[cursor++];
-   if(generation!==mediaGeneration)return;
-   if(stopBatch)break;
-   if(item.state!=='pending')continue;
-   item.state='uploading';setMediaDetail(item,'开始上传');if(!previewItem)showMediaItem(item);if(previewItem===item)$('progress').value=0;
-   updateBatchStatus();
-   try{
-    const form=new FormData();form.append('file',item.file);
-    for(const [key,value] of Object.entries(settings))if(key!=='output'||item.kind==='video')form.append(key,value);
-    const {job_id}=await uploadMediaItem(item,form,generation);
-    if(generation!==mediaGeneration){void stopMediaJobs([job_id]);return;}
-    item.jobId=job_id;item.state='processing';
-    activeMediaJobs.add(job_id);
-    if(stopBatch)await jsonResponse(await fetch('/api/jobs/'+job_id+'/stop',{method:'POST'}));
-    let job;
-    const stages={queued:'等待服务器处理',decoding:'服务器解码',warming:'模型预热',detecting:'检测并画框',muxing:'封装音轨'};
-    while(true){
-     if(generation!==mediaGeneration)return;
-     job=await jsonResponse(await fetch('/api/jobs/'+job_id,{cache:'no-store',signal:controller.signal}));
-     if(generation!==mediaGeneration)return;
-     if(job.status==='error')throw new Error(job.error);
-     if(job.status==='cancelled'){item.state='stopped';setMediaDetail(item,'任务已停止，可重新排队从头处理');item.retryNode.hidden=false;break;}
-     if(job.status==='done')break;
-     let detail=stages[job.stage]||'处理中';
-     if(job.frames)detail+=` · ${job.frames}${job.total?'/'+job.total:''} 帧`;
-     if(job.processing_fps)detail+=` · ${job.processing_fps} FPS`;
-     if(job.engine)detail+='\n实际引擎：'+job.engine;
-     setMediaDetail(item,detail+videoHardwareInfo(job));
-     if(previewItem===item){if(job.total)$('progress').value=Math.min(99,100*(job.frames||0)/job.total);else $('progress').removeAttribute('value');}
-     await sleep(1000);
-    }
-    if(item.state==='stopped')continue;
-    const m=job.metadata;
-    item.url='/api/jobs/'+job_id+'/result';
-    item.downloadName=item.file.name.replace(/\.[^.]+$/,'')+'-detected'+(item.kind==='image'?'.jpg':'.mp4');
-    let summary=`完成 · ${m.source_w}×${m.source_h} → ${m.output_w}×${m.output_h}\n实际引擎：${m.engine} · 输入 ${m.input_w}×${m.input_h}`;
-    if(item.kind==='video'){
-     summary+=`\n${m.frames} 帧 · 原帧率 ${m.source_fps} · ${m.processing_fps} FPS · 总耗时 ${job.elapsed}s`;
-     summary+=m.timing==='source_pts'?'\n按原始时间戳播放。':'\n缺失时间戳使用标称帧率。';
-     if(m.warmup_runs)summary+=`\n模型预热 ${m.warmup_runs} 次 / ${m.warmup_ms}ms；处理FPS不含初始化、预热和最后音轨封装。`;
-    }else summary+=`\n${m.detections} 个目标 · 总耗时 ${job.elapsed}s`;
-    item.state='done';setMediaDetail(item,summary+videoHardwareInfo(m));
-    item.downloadNode.href=item.url;item.downloadNode.download=item.downloadName;item.downloadNode.hidden=false;
-    if(previewItem===item)showMediaItem(item);
-    if(previewItem===item)$('progress').value=100;
-   }catch(error){if(generation!==mediaGeneration)return;item.state='error';setMediaDetail(item,'处理失败：'+error.message);item.retryNode.hidden=false;}
-   finally{if(item.jobId)activeMediaJobs.delete(item.jobId);if(generation===mediaGeneration)updateBatchStatus();}
-   updateBatchStatus();
+function currentMediaSettings(){
+ return {conf:confidence('mediaConf'),engine:$('mediaEngine').value,profile:$('profile').value,output:'original'};
+}
+async function runMediaItem(item,generation){
+ const controller=new AbortController();item.controller=controller;
+ const previousId=item.jobId;item.previousId=previousId;item.jobId=null;
+ item.state='uploading';setMediaDetail(item,previousId?'正在复用原文件重新开始…':'开始上传');updateBatchStatus();
+ try{
+  item.settings??=currentMediaSettings();
+  let submitted;
+  if(previousId){
+   const response=await fetch('/api/jobs/'+previousId+'/retry',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(item.settings)});
+   // 文件过期后仍可使用浏览器保留的 File 重新上传。
+   if(response.status!==404&&response.status!==410)submitted=await jsonResponse(response);
   }
- }
- try{await Promise.all(Array.from({length:parallel},()=>worker()));}
- finally{
+  if(!submitted){
+   if(generation!==mediaGeneration||item.removed)return;
+   const form=new FormData();form.append('file',item.file);
+   for(const [key,value] of Object.entries(item.settings))if(key!=='output'||item.kind==='video')form.append(key,value);
+   submitted=await uploadMediaItem(item,form,generation);
+  }
+  const job_id=submitted.job_id;
+  if(generation!==mediaGeneration||item.removed){void deleteServerJob(job_id);return;}
+  item.jobId=job_id;item.state='processing';activeMediaJobs.add(job_id);
+  if(item.cancelRequested){
+   const failed=await stopMediaJobs([job_id]);
+   if(failed.length){item.cancelRequested=false;setMediaDetail(item,'取消请求失败，请重试');}
+  }
+  updateBatchStatus();
+  const stages={queued:'等待服务器处理',decoding:'服务器解码',warming:'模型预热',detecting:'原图检测并画框',muxing:'封装音轨'};
+  let job;
+  while(true){
+   job=await jsonResponse(await fetch('/api/jobs/'+job_id,{cache:'no-store',signal:controller.signal}));
+   if(generation!==mediaGeneration||item.removed)return;
+   if(job.status==='error')throw new Error(job.error);
+   if(job.status==='cancelled'){item.state='stopped';setMediaDetail(item,'已取消，可单独重新开始');return;}
+   if(job.status==='done')break;
+   let detail=item.cancelRequested?'正在取消…':(stages[job.stage]||'处理中');
+   if(job.frames)detail+=` · ${job.frames}${job.total?'/'+job.total:''} 帧`;
+   if(job.processing_fps)detail+=` · ${job.processing_fps} FPS`;
+   if(job.engine)detail+='\n模型：'+job.engine;
+   setMediaDetail(item,detail+videoHardwareInfo(job));
+   if(previewItem===item){if(job.total)$('progress').value=Math.min(99,100*(job.frames||0)/job.total);else $('progress').removeAttribute('value');}
+   await sleep(500);
+  }
+  const m=job.metadata;
+  item.url='/api/jobs/'+job_id+'/result';
+  item.downloadName=item.file.name.replace(/\.[^.]+$/,'')+'-detected'+(item.kind==='image'?'.jpg':'.mp4');
+  let summary=`完成 · 原图 ${m.source_w}×${m.source_h} → 输出 ${m.output_w}×${m.output_h}\n模型：${m.engine} · 推理 ${m.input_w}×${m.input_h}`;
+  if(item.kind==='video'){
+   summary+=`\n${m.frames} 帧 · 原帧率 ${m.source_fps} · 处理 ${m.processing_fps} FPS · 总耗时 ${job.elapsed}s`;
+   summary+=m.timing==='source_pts'?'\n按原始时间戳播放。':'\n缺失时间戳使用标称帧率。';
+  }else summary+=`\n${m.detections} 个目标 · 总耗时 ${job.elapsed}s`;
+  item.state='done';setMediaDetail(item,summary+videoHardwareInfo(m));
+  item.downloadNode.href=item.url;item.downloadNode.download=item.downloadName;item.downloadNode.hidden=false;
+  if(previewItem===item){showMediaItem(item);$('progress').value=100;}
+ }catch(error){
+  if(generation!==mediaGeneration||item.removed)return;
+  if(item.jobId)await stopMediaJobs([item.jobId]);
+  if(generation!==mediaGeneration||item.removed)return;
+  if(!item.jobId)item.jobId=previousId;
+  item.state=item.cancelRequested?'stopped':'error';setMediaDetail(item,(item.cancelRequested?'任务已取消：':'处理失败：')+error.message);
+ }finally{
   if(generation===mediaGeneration){
-  activeMediaJobs.clear();$('stopTask').disabled=true;
-  mediaPoll=null;
-  mediaBusy=false;for(const id of mediaControlIds)$(id).disabled=false;
-  for(const item of mediaItems)item.retryNode.disabled=false;
-  $('progress').hidden=true;updateBatchStatus();
+   if(item.jobId)activeMediaJobs.delete(item.jobId);
+   item.controller=null;mediaRunning--;updateBatchStatus();pumpMediaQueue();
   }
  }
+}
+function pumpMediaQueue(){
+ const parallel=Math.max(1,Math.min(4,Number($('mediaParallel').value)||3));
+ while(mediaRunning<parallel){
+  const item=mediaItems.find(item=>item.state==='pending'&&item.ready&&!item.cancelRequested);
+  if(!item)break;
+  mediaRunning++;void runMediaItem(item,mediaGeneration);
+ }
+ updateBatchStatus();
+}
+$('detect').onclick=()=>{
+ for(const item of mediaItems)if(item.state==='pending')item.ready=true;
+ pumpMediaQueue();
 };
+$('mediaParallel').onchange=()=>{if(mediaBusy)pumpMediaQueue();};
 
 $('resultVideo').onerror=()=>{if($('resultVideo').getAttribute('src'))message('mediaStatus',$('mediaStatus').textContent+'\n浏览器无法播放该结果，请下载查看或检查服务器日志。');};
 $('quality').oninput=()=>{$('qualityValue').textContent=Math.round(Number($('quality').value)*100)+'%';};
@@ -1539,28 +1694,23 @@ for(const id of ['mediaConf','liveConf']){
  number.onchange=()=>{const value=Number(number.value);number.value=(number.value!==''&&Number.isFinite(value)?Math.min(1,Math.max(0,value)):Number(slider.value)).toFixed(2);slider.value=number.value;changed();};
 }
 
-function enginesForAspect(value){
- const ratio=value==='4:3'?4/3:16/9;
- // 允许标称画幅与按步长对齐的引擎尺寸之间存在少量补边差异。
- return catalog.filter(e=>Math.abs(Math.log((e.w/e.h)/ratio))<.05);
-}
 function selectedLiveEngine(){return catalog.find(e=>e.key===$('liveEngine').value);}
 function refreshLiveEngines(){
  const previous=$('liveEngine').value;
- const candidates=enginesForAspect($('liveAspect').value);
+ const candidates=[...catalog];
  const order={s:0,n:1,m:2,l:3,x:4};
- candidates.sort((a,b)=>b.h-a.h||b.w-a.w||(order[a.model]??99)-(order[b.model]??99));
+ candidates.sort((a,b)=>(order[a.model]??99)-(order[b.model]??99));
  $('liveEngine').replaceChildren();
  for(const engine of candidates){const option=document.createElement('option');option.value=engine.key;option.textContent=engine.label;$('liveEngine').appendChild(option);}
  if(candidates.some(e=>e.key===previous))$('liveEngine').value=previous;
- else if(candidates.length){const preferred=[...candidates].sort((a,b)=>Math.abs(a.h-1080)-Math.abs(b.h-1080)||(order[a.model]??99)-(order[b.model]??99));$('liveEngine').value=preferred[0].key;}
- else{const option=document.createElement('option');option.value='';option.textContent='服务器没有该比例的模型';$('liveEngine').appendChild(option);}
+ else if(candidates.length)$('liveEngine').value=candidates[0].key;
+ else{const option=document.createElement('option');option.value='';option.textContent='服务器没有可用的 640×640 模型';$('liveEngine').appendChild(option);}
  $('start').disabled=!!cameraStream||!candidates.length;
  invalidateLiveView();
 }
 // 配置或画幅变化时递增版本号，用于丢弃旧配置下尚未返回的检测结果。
 function invalidateLiveView(){liveRevision++;lastDets=[];lastVideoTime=-1;geometryKey='';liveContext.clearRect(0,0,$('liveCanvas').width,$('liveCanvas').height);}
-$('liveAspect').onchange=()=>{refreshLiveEngines();if(cameraStream)void startLive();};
+$('liveAspect').onchange=$('liveResolution').onchange=()=>{invalidateLiveView();if(cameraStream)void startLive();};
 $('liveEngine').onchange=()=>{invalidateLiveView();if(cameraStream)void startLive();};
 $('liveOrientation').onchange=invalidateLiveView;
 function serverRendering(){return $('liveRender').value==='server';}
@@ -1603,15 +1753,14 @@ function updateLiveGeometry(){
  const sourceWidth=video.videoWidth,sourceHeight=video.videoHeight;
  const aspect=$('liveAspect').value;
  const orientation=$('liveOrientation').value;
- const key=`${sourceWidth}:${sourceHeight}:${aspect}:${engine.key}:${orientation}`;
+ const key=`${sourceWidth}:${sourceHeight}:${aspect}:${$('liveResolution').value}:${orientation}`;
  if(key===geometryKey)return;
  const [baseW,baseH]=aspect==='4:3'?[4,3]:[16,9];
  // 以视频元素的实际尺寸为准；轨道设置中的宽高可能互换。
  const portrait=orientation==='portrait'||(orientation==='auto'&&sourceHeight>sourceWidth);
  const [rw,rh]=portrait?[baseH,baseW]:[baseW,baseH];
- // 在标称尺寸内按所选比例向下取整，竖屏时交换输出宽高；不旋转源像素。
- // 例如：1920×1088 引擎接收 1920×1080 的 JPEG 后，在 GPU 上补边。
- const unit=Math.max(1,Math.floor(Math.min(engine.w/baseW,engine.h/baseH)));
+ // 采集/显示画幅由 720p 或 1080p 决定，与引擎尺寸无关。
+ const unit=Number($('liveResolution').value)/baseH;
  const width=rw*unit,height=rh*unit;
  const fit=Math.min(width/sourceWidth,height/sourceHeight);
  const dw=sourceWidth*fit,dh=sourceHeight*fit;
@@ -1695,13 +1844,13 @@ async function startLive(){
   $('start').disabled=true;$('stop').disabled=false;message('liveStatus','正在打开摄像头…');
   const device=$('camera').value;
   const [rw,rh]=$('liveAspect').value==='4:3'?[4,3]:[16,9];
-  const unit=Math.max(1,Math.floor(Math.min(engine.w/rw,engine.h/rh)));
+  const unit=Number($('liveResolution').value)/rh;
   // 初始设备方向仅作为请求提示；打开后以 videoWidth/videoHeight 为准。
   const orientation=$('liveOrientation').value;
   const portraitHint=orientation==='portrait'||(orientation==='auto'&&window.matchMedia('(pointer: coarse)').matches&&
    (screen.orientation?.type?.startsWith('portrait')??window.matchMedia('(orientation: portrait)').matches));
   const requestedWidth=(portraitHint?rh:rw)*unit,requestedHeight=(portraitHint?rw:rh)*unit;
-  const targetFps=$('liveTransport').value==='webrtc'?Number($('rtcFps').value):60;
+  const targetFps=rtcTargetFps();
   const constraints={width:{exact:requestedWidth},height:{exact:requestedHeight},frameRate:{exact:targetFps}};
   if(device)constraints.deviceId={exact:device};else constraints.facingMode={ideal:'environment'};
   let acquired,fallback=false;
@@ -1810,10 +1959,10 @@ async function sendCapture(){
 async function continuousCapture(generation){
  while(generation===liveGeneration&&liveReady){
   updateLiveGeometry();
+  const begin=performance.now();
   const sent=await sendCapture();
-  // 编码时已让出执行权给浏览器；成功发送一帧后无需额外定时等待。
-  // 没有新帧或连接发送积压时，短暂等待，避免空转。
-  if(!sent)await sleep(4);
+  // JPEG 和 WebRTC 使用同一目标帧率；编码较慢时自然降低实际发送率。
+  await sleep(sent?Math.max(0,1000/rtcTargetFps()-(performance.now()-begin)):4);
  }
 }
 let renderedSignature='';
@@ -1847,7 +1996,7 @@ function rtcTargetFps(){return Number($('rtcFps').value)||60;}
 let rtcPeer=null,rtcChannel=null,rtcSession=null,rtcTimer=null,rtcFetch=null;
 let rtcRevision=-1,rtcRtt=null,rtcStatsText='',rtcPrevious=null,rtcStatsBusy=false;
 let rtcSenderNote='',rtcPreviousSource=null;
-let rtcStartAt=0,rtcFirstResultMs=null,rtcFirstVideoMs=null;
+let rtcStartAt=0,rtcFirstResultMs=null,rtcFirstVideoMs=null,rtcIceMs=null,rtcSignalingMs=null;
 let rtcPreparedReceiver=null;
 function prepareRtcReceiver(generation){
  const peer=new RTCPeerConnection({iceServers:[]});
@@ -1992,13 +2141,13 @@ function updateTransportControls(){
  const rtc=$('liveTransport').value==='webrtc';
  for(const id of ['quality','jpegMode','bufferMode'])$(id).disabled=rtc;
  $('rtcBitrate').disabled=!rtc;
- $('rtcFps').disabled=!rtc;
+ $('rtcFps').disabled=false;
  $('rtcQueue').disabled=!rtc;
  updateResultSurface();
 }
 $('liveTransport').onchange=()=>{if(cameraStream)stopLive();updateTransportControls();};
 updateTransportControls();
-$('rtcFps').onchange=()=>{if(cameraStream&&rtcPeer)void startLive();};
+$('rtcFps').onchange=()=>{if(cameraStream)void startLive();};
 $('rtcBitrate').onchange=()=>{if(cameraStream&&rtcPeer)void startLive();};
 $('rtcQueue').onchange=()=>{if(cameraStream&&rtcPeer)void startLive();};
 function iceReady(peer){
@@ -2044,7 +2193,7 @@ async function rtcStatistics(peer,generation){
 async function startRtc(stream,generation){
  if(!window.RTCPeerConnection)throw new Error('浏览器不支持WebRTC，请选择JPEG');
  if(!liveGeometry)throw new Error('摄像头尚未提供视频尺寸，请重新开始');
- rtcStartAt=performance.now();rtcFirstResultMs=null;rtcFirstVideoMs=null;
+ rtcStartAt=performance.now();rtcFirstResultMs=null;rtcFirstVideoMs=null;rtcIceMs=null;rtcSignalingMs=null;
  if(serverRendering())prepareRtcReceiver(generation);
  const peer=new RTCPeerConnection({iceServers:[]});rtcPeer=peer;
  let channel;
@@ -2068,16 +2217,19 @@ async function startRtc(stream,generation){
  const offer=await peer.createOffer();if(generation!==liveGeneration)return;
  // 不协商 RTP 摄像头方向扩展，因为 RTSP 无法保留该元数据。
  offer.sdp=offer.sdp.split('\r\n').filter(line=>!(line.startsWith('a=extmap:')&&line.includes('urn:3gpp:video-orientation'))).join('\r\n');
+ const iceStarted=performance.now();
  await peer.setLocalDescription(offer);await iceReady(peer);if(generation!==liveGeneration)return;
+ rtcIceMs=performance.now()-iceStarted;
  const controller=new AbortController();rtcFetch=controller;
- message('liveStatus',cameraRequestLabel+'\n正在预热所选画幅并连接视频流，预热期间尚未上传视频…');
+ message('liveStatus',cameraRequestLabel+'\n正在协商视频连接；模型已在服务启动时预热…');
  const timeout=setTimeout(()=>controller.abort(),60000);
- let answer;
+ let answer;const signalingStarted=performance.now();
  try{
   answer=await jsonResponse(await fetch('/api/webrtc/offer',{method:'POST',headers:{'Content-Type':'application/json'},signal:controller.signal,
    body:JSON.stringify({sdp:peer.localDescription.sdp,type:peer.localDescription.type,config:{engine:$('liveEngine').value,conf:confidence('liveConf'),revision:liveRevision,width:liveGeometry.width,height:liveGeometry.height,render:$('liveRender').value,bitrate:Number($('rtcBitrate').value),fps:rtcTargetFps(),queue_policy:$('rtcQueue').value}})}));
  }finally{clearTimeout(timeout);if(rtcFetch===controller)rtcFetch=null;}
  if(generation!==liveGeneration){void fetch('/api/webrtc/'+answer.session_id,{method:'DELETE'}).catch(()=>{});return;}
+ rtcSignalingMs=performance.now()-signalingStarted;
  rtcSession=answer.session_id;await peer.setRemoteDescription({sdp:answer.sdp,type:answer.type});
  if(generation!==liveGeneration)return;
  await configureRtcSender(transceiver.sender);
@@ -2109,9 +2261,9 @@ async function startRtc(stream,generation){
   lastDetTime=now;received++;
   if(now-lastStatusAt<250)return;lastStatusAt=now;
   const elapsed=Math.max(.01,(now-lastStatsAt)/1000);
-  message('liveStatus',`WebRTC / MediaMTX · ${g.aspectLabel} · 显示 ${g.width}×${g.height} · 接收视频 ${data.source_width}×${data.source_height}\n${rtcStatsText}\n检测 ${(received/elapsed).toFixed(1)} FPS · 预测 ${data.infer_ms}ms · BGR转换 ${data.convert_ms}ms · 锁等待 ${data.wait_ms}ms\n解码取帧后耗时 ${data.server_ms}ms · 应用排队 ${data.queue_ms}ms · 结果通道往返 ${rtcRtt===null?'—':rtcRtt.toFixed(1)+'ms'}\n${data.decoder} · ${data.queue_policy==='latest'?'低延迟待处理':'FIFO待处理'} ${data.pending}/${data.queue_capacity??1} 帧${data.queue_policy==='latest'?' · 已丢弃待处理旧帧 '+(data.replaced??0):''}${data.fallback?" · 解码回退："+data.fallback:""}\n连接前画幅预热 ${data.warmup_ms??'—'}ms（未计入视频延迟）\nJPEG质量/缓冲设置不参与；往返时间不是视频端到端延迟。`);
+  message('liveStatus',`WebRTC / MediaMTX · ${g.aspectLabel} · 显示 ${g.width}×${g.height} · 接收视频 ${data.source_width}×${data.source_height}\n${rtcStatsText}\n检测 ${(received/elapsed).toFixed(1)} FPS · 预测 ${data.infer_ms}ms · BGR转换 ${data.convert_ms}ms · 锁等待 ${data.wait_ms}ms\n解码取帧后耗时 ${data.server_ms}ms · 应用排队 ${data.queue_ms}ms · 结果通道往返 ${rtcRtt===null?'—':rtcRtt.toFixed(1)+'ms'}\n${data.decoder} · ${data.queue_policy==='latest'?'低延迟待处理':'FIFO待处理'} ${data.pending}/${data.queue_capacity??1} 帧${data.queue_policy==='latest'?' · 已丢弃待处理旧帧 '+(data.replaced??0):''}${data.fallback?" · 解码回退："+data.fallback:""}\n模型预热已在服务启动时完成；连接不重复预热\nJPEG质量/缓冲设置不参与；往返时间不是视频端到端延迟。`);
   if(elapsed>5){lastStatsAt=now;received=0;}
-  $('liveStatus').textContent+=`\n启动：解码器首帧 ${data.decoder_startup_ms??'—'}ms · 编码器初始化 ${data.encoder_init_ms??'不使用'}ms · WebRTC启动→首结果 ${rtcFirstResultMs?.toFixed(0)??'—'}ms · →首播放 ${rtcFirstVideoMs?.toFixed(0)??'等待中'}ms`;
+  $('liveStatus').textContent+=`\n启动：ICE收集 ${rtcIceMs?.toFixed(0)??'—'}ms · 信令请求 ${rtcSignalingMs?.toFixed(0)??'—'}ms（服务端WHIP ${data.whip_ms??'—'}ms） · 解码器首帧 ${data.decoder_startup_ms??'—'}ms · 编码器初始化 ${data.encoder_init_ms??'不使用'}ms · WebRTC启动→首结果 ${rtcFirstResultMs?.toFixed(0)??'—'}ms · →首播放 ${rtcFirstVideoMs?.toFixed(0)??'等待中'}ms`;
   if(data.render==='server')$('liveStatus').textContent+=`\n服务器同帧画框 ${data.server_draw_ms}ms · ${data.output_encoder||'初始化'} 编码/发布 ${data.server_encode_ms??'—'}ms · 回传编码目标 ${rtcTargetFps()} FPS\n${rtcPlaybackStatus}${data.output_note?' · '+data.output_note:''}`;
  };
  channel.onclose=()=>{if(generation===liveGeneration){stopLive();message('liveStatus','WebRTC结果通道关闭，请重新开始。');}};
@@ -2153,7 +2305,7 @@ import uuid
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Body, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse
 from starlette.background import BackgroundTask
 import uvicorn
@@ -2161,6 +2313,7 @@ import uvicorn
 
 BASE = Path(__file__).resolve().parent
 ENGINE_DIR = Path(os.environ.get('ENGINE_DIR', BASE))
+JOB_RETENTION_SECONDS = 15 * 60
 jobs = {}
 jobs_lock = threading.Lock()
 media_executor = ThreadPoolExecutor(max_workers=max(1, min(4, int(os.environ.get('MEDIA_WORKERS', '4')))), thread_name_prefix='media')
@@ -2168,16 +2321,25 @@ pool = None
 live_pipeline = None
 
 
-# 清理结束超过六小时且没有下载者的任务，下载期间通过 readers 计数保护结果。
+# 从结束时刻起保留 15 分钟，下载不续期；显式删除在处理/读取结束后执行。
 def cleanup_jobs():
     with jobs_lock:
         expired = [job_id for job_id, job in jobs.items()
                    if job['status'] in ('done', 'error', 'cancelled') and not job.get('readers', 0)
-                   and time.time() - job['updated'] > 6 * 3600]
+                   and (job.get('delete_requested')
+                        or time.time() - job.get('finished_at', job['updated']) >= JOB_RETENTION_SECONDS)]
         for job_id in expired:
-            job = jobs.pop(job_id)
+            job = jobs[job_id]
             # 仅删除本进程创建的任务目录，不使用用户提供的路径。
-            shutil.rmtree(job['directory'], ignore_errors=True)
+            try:
+                shutil.rmtree(job['directory'])
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                # 删除失败时保留记录，下次清理重试，避免宣称删除却遗留文件。
+                print(f'[media/cleanup] {job_id}: 清理失败，稍后重试: {exc}', flush=True)
+                continue
+            jobs.pop(job_id, None)
 
 
 # 服务接收请求前初始化并预热引擎；关闭时回收会话、工作线程及临时文件。
@@ -2200,6 +2362,10 @@ async def lifespan(app):
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
     await webrtc_shutdown()
+    with jobs_lock:
+        for job in jobs.values():
+            if job['status'] not in ('done', 'error', 'cancelled'):
+                job['cancel_requested'] = True
     await asyncio.to_thread(media_executor.shutdown, wait=True)
     for job in jobs.values():
         shutil.rmtree(job['directory'], ignore_errors=True)
@@ -2211,6 +2377,8 @@ webrtc_shutdown, webrtc_reap = install_webrtc(app, lambda: pool)
 
 def update_job(job_id, **values):
     with jobs_lock:
+        if values.get('status') in ('done', 'error', 'cancelled'):
+            values['finished_at'] = time.time()
         jobs[job_id].update(values, updated=time.time())
 
 
@@ -2232,9 +2400,13 @@ def run_media_job(job_id, kind, source, result, options):
         processor = process_image if kind == 'image' else process_video
         metadata = processor(source, result, pool, options,
                              report)
-        check_cancel()
-        update_job(job_id, status='done', stage='done', metadata=metadata,
-                   elapsed=round(time.perf_counter() - started, 2))
+        # 成功与取消在同一把锁内提交，避免取消请求落在最后检查与完成之间。
+        with jobs_lock:
+            if jobs[job_id].get('cancel_requested'):
+                raise RuntimeError('任务已停止')
+            jobs[job_id].update(status='done', stage='done', metadata=metadata,
+                                elapsed=round(time.perf_counter() - started, 2),
+                                finished_at=time.time(), updated=time.time())
         print(f'[media/{kind}] {job_id}: {json.dumps(metadata, ensure_ascii=False)}', flush=True)
     except Exception as exc:
         traceback.print_exc()
@@ -2242,32 +2414,53 @@ def run_media_job(job_id, kind, source, result, options):
             cancelled = jobs[job_id].get('cancel_requested', False)
         update_job(job_id, status='cancelled' if cancelled else 'error',
                    stage='cancelled' if cancelled else 'error', error=str(exc))
-    finally:
-        try:
-            Path(source).unlink(missing_ok=True)
-        except OSError:
-            pass
+        # 保留源文件供单任务重试；失败的输出不能作为完成结果下载。
+        for partial in (Path(result), Path(result).with_name('annotated-silent.mp4')):
+            try:
+                partial.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def enqueue_media_job(job_id, kind, source, result, options):
+    # 在同一把锁内登记 Future，避免极快任务在登记前被清理。
+    with jobs_lock:
+        future = media_executor.submit(run_media_job, job_id, kind, source, result, options)
+        job = jobs[job_id]
+        job['future'] = future
+        if job.get('cancel_requested') and future.cancel():
+            job.update(status='cancelled', stage='cancelled', finished_at=time.time(), updated=time.time())
+
+
+def validate_media_options(options):
+    if pool is None:
+        raise HTTPException(503, '模型目录尚未初始化')
+    if set(options) != {'conf', 'engine', 'profile', 'output'}:
+        raise HTTPException(400, '请提供模型、策略、置信度和输出选项')
+    conf, engine, profile, output = (options[key] for key in ('conf', 'engine', 'profile', 'output'))
+    if not isinstance(conf, (float, int)) or isinstance(conf, bool) or not math.isfinite(conf) or not 0 <= conf <= 1:
+        raise HTTPException(400, '置信度必须在 0 到 1 之间')
+    if profile not in ('speed', 'balanced', 'detail') or output != 'original':
+        raise HTTPException(400, '无效的处理选项')
+    if not isinstance(engine, str) or (engine != 'auto' and engine not in pool.engines):
+        raise HTTPException(400, '引擎不存在，请刷新页面')
+    return dict(conf=float(conf), engine=engine, profile=profile, output=output)
 
 
 # 验证参数并预留任务名额，将上传内容分块落盘后提交后台执行器。
 async def submit_media(kind, file, conf, engine, profile, output):
-    if pool is None:
-        raise HTTPException(503, '模型目录尚未初始化')
-    if not np.isfinite(conf) or not 0 <= conf <= 1:
-        raise HTTPException(400, '置信度必须在 0 到 1 之间')
-    if profile not in ('speed', 'balanced', 'detail') or output not in ('original', 'nearest'):
-        raise HTTPException(400, '无效的处理选项')
-    if engine != 'auto' and engine not in pool.engines:
-        raise HTTPException(400, '引擎不存在，请刷新页面')
+    options = validate_media_options(dict(conf=conf, engine=engine, profile=profile, output=output))
     job_id = uuid.uuid4().hex
     with jobs_lock:
-        if sum(j['status'] not in ('done', 'error', 'cancelled') for j in jobs.values()) >= 4:
+        if sum(j['status'] not in ('done', 'error', 'cancelled') for j in jobs.values()) >= 32:
             raise HTTPException(429, '上传处理队列已满，请稍后再试')
         directory = Path(tempfile.mkdtemp(prefix='yolo-media-'))
         source = directory / 'source'
         result = directory / ('result.jpg' if kind == 'image' else 'result.mp4')
-        jobs[job_id] = dict(status='uploading', stage='uploading', kind=kind,
-                            directory=str(directory), result=str(result), updated=time.time(), readers=0)
+        jobs[job_id] = dict(status='uploading', stage='uploading', kind=kind, family_id=job_id,
+                            directory=str(directory), source=str(source), result=str(result),
+                            options=dict(conf=conf, engine=engine, profile=profile, output=output),
+                            updated=time.time(), readers=0)
     options = dict(conf=conf, engine=engine, profile=profile, output=output)
     try:
         # UploadFile 由 Starlette 暂存；分块复制，避免将整个视频读入内存。
@@ -2283,7 +2476,7 @@ async def submit_media(kind, file, conf, engine, profile, output):
         if not source.stat().st_size:
             raise ValueError('上传文件为空')
         update_job(job_id, status='queued', stage='queued')
-        media_executor.submit(run_media_job, job_id, kind, str(source), str(result), options)
+        enqueue_media_job(job_id, kind, str(source), str(result), options)
         return dict(job_id=job_id)
     except BaseException:
         with jobs_lock:
@@ -2323,7 +2516,7 @@ async def job_status(job_id: str):
         job = jobs.get(job_id)
         if job is None:
             raise HTTPException(404, '任务不存在或已过期')
-        return {k: v for k, v in job.items() if k not in ('directory', 'result', 'readers')}
+        return {k: v for k, v in job.items() if k not in ('directory', 'source', 'result', 'readers', 'future')}
 
 
 @app.post('/api/jobs/{job_id}/stop')
@@ -2335,7 +2528,72 @@ async def stop_media_job(job_id: str):
         if job['status'] not in ('done', 'error', 'cancelled'):
             job['cancel_requested'] = True
             job['updated'] = time.time()
+            future = job.get('future')
+            if future is not None and future.cancel():
+                job.update(status='cancelled', stage='cancelled', finished_at=time.time())
         return dict(status=job['status'], stop_requested=job.get('cancel_requested', False))
+
+
+@app.post('/api/jobs/{job_id}/retry', status_code=202)
+async def retry_media_job(job_id: str, options: dict | None = Body(default=None)):
+    # 每次重试使用新任务和结果路径，已下载/播放的旧结果保持有效。
+    with jobs_lock:
+        previous = jobs.get(job_id)
+        if previous is None:
+            raise HTTPException(404, '原任务已过期，请重新选择文件上传')
+        if previous.get('delete_requested') or time.time() - previous.get('finished_at', time.time()) >= JOB_RETENTION_SECONDS:
+            raise HTTPException(410, '原文件已过期或删除，请重新上传')
+        if previous['status'] not in ('done', 'error', 'cancelled'):
+            raise HTTPException(409, '请等待当前任务结束或取消完成后再重新开始')
+        if sum(j['status'] not in ('done', 'error', 'cancelled') for j in jobs.values()) >= 32:
+            raise HTTPException(429, '上传处理队列已满，请稍后再试')
+        if not Path(previous['source']).is_file():
+            raise HTTPException(410, '原文件已清理，请重新选择文件上传')
+        # 新页面传递本次条件；未带请求体的旧客户端保持原来的重试行为。
+        options = validate_media_options(dict(previous['options']) if options is None else options)
+        new_id = uuid.uuid4().hex
+        directory = Path(tempfile.mkdtemp(prefix='yolo-media-'))
+        source = directory / 'source'
+        kind = previous['kind']
+        result = directory / ('result.jpg' if kind == 'image' else 'result.mp4')
+        try:
+            # 同一临时文件系统内硬链接复用原文件，避免大视频重传或复制。
+            os.link(previous['source'], source)
+        except OSError as exc:
+            shutil.rmtree(directory, ignore_errors=True)
+            raise HTTPException(500, '无法复用原文件，请重新上传') from exc
+        jobs[new_id] = dict(status='queued', stage='queued', kind=kind,
+                            family_id=previous['family_id'],
+                            directory=str(directory), source=str(source), result=str(result),
+                            options=options, updated=time.time(), readers=0)
+    try:
+        enqueue_media_job(new_id, kind, str(source), str(result), options)
+    except Exception:
+        with jobs_lock:
+            jobs.pop(new_id, None)
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+    return dict(job_id=new_id)
+
+
+@app.delete('/api/jobs/{job_id}', status_code=202)
+async def delete_media_job(job_id: str):
+    with jobs_lock:
+        target = jobs.get(job_id)
+        if target is None:
+            return dict(status='deleted')
+        family = target['family_id']
+        for job in jobs.values():
+            if job['family_id'] != family:
+                continue
+            job['delete_requested'] = True
+            job['cancel_requested'] = True
+            future = job.get('future')
+            if future is not None and future.cancel():
+                job.update(status='cancelled', stage='cancelled', finished_at=time.time())
+    # 仍在读写的任务由后台清理循环在结束后删除，不破坏正在使用的文件。
+    cleanup_jobs()
+    return dict(status='deleting')
 
 
 def release_result(job_id):
@@ -2343,6 +2601,7 @@ def release_result(job_id):
         if job_id in jobs:
             jobs[job_id]['readers'] -= 1
             jobs[job_id]['updated'] = time.time()
+    cleanup_jobs()
 
 
 # 增加结果读取计数，响应结束后由后台回调释放，防止下载期间被过期清理。
@@ -2352,6 +2611,8 @@ async def job_result(job_id: str):
         job = jobs.get(job_id)
         if job is None:
             raise HTTPException(404, '任务不存在或已过期')
+        if job.get('delete_requested') or time.time() - job.get('finished_at', time.time()) >= JOB_RETENTION_SECONDS:
+            raise HTTPException(410, '结果已过期或删除')
         if job['status'] != 'done':
             raise HTTPException(409, '任务尚未完成')
         job['readers'] += 1
@@ -2374,6 +2635,9 @@ async def realtime(websocket: WebSocket):
     # 当推理速度跟不上输入时，
     # 有界队列通过等待入队向接收端传递背压。
     pending_frames = asyncio.Queue(maxsize=4)
+    # 每连接固定工作线程及解码器，避免默认线程池切换和多连接争用同一解码锁。
+    jpeg_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='jpeg-process')
+    pipeline = RealtimePipeline(pool)
 
     async def receive_frames():
         config = None
@@ -2402,7 +2666,7 @@ async def realtime(websocket: WebSocket):
             raw, config, arrived = await pending_frames.get()
             started = time.perf_counter()
             try:
-                result = await asyncio.to_thread(process_live_frame, raw, config)
+                result = await asyncio.wrap_future(jpeg_executor.submit(pipeline.process, raw, config))
             except Exception as exc:
                 result = dict(type='result', id=config['id'], error=str(exc))
             completed = time.perf_counter()
@@ -2438,6 +2702,7 @@ async def realtime(websocket: WebSocket):
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.to_thread(jpeg_executor.shutdown, wait=True, cancel_futures=True)
         while not pending_frames.empty():
             pending_frames.get_nowait()
         try:

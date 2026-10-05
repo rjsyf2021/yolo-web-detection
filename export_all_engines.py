@@ -1,9 +1,11 @@
-"""批量导出 YOLO26 n/s/m/l/x 检测模型的 16:9 和 4:3 半精度 TensorRT 引擎。
+"""导出 YOLO26 n/s/m/l/x 检测模型的原生训练分辨率 FP16 TensorRT 引擎。
 
+每个型号只导出一个档位：权重自带的原生训练尺寸（正方形，YOLO26 默认 640×640），
+不再预生成 16:9 / 4:3 的多种分辨率；可用 --size 覆盖。
 使用 Ultralytics FP16 导出流程；当前 TensorRT 11 环境通过 ModelOpt
-在 CUDA GPU 0 上执行参考推理并选择混合精度。档位不超过 1080p，
-参考推理一次性采集中间输出，较大模型需要更多显存与系统内存。
-ONNX 导出、参考推理、引擎构建分别使用独立子进程，单档失败后继续其余档位。
+在 CUDA GPU 0 上执行参考推理并选择混合精度（FP16 权重 + 少量 FP32 算子），
+参考推理一次性采集中间输出，模型越大对显存与系统内存要求越高。
+ONNX 导出、参考推理、引擎构建分别使用独立子进程，单个型号失败后继续其余型号。
 """
 import argparse
 import ast
@@ -20,22 +22,25 @@ from unittest.mock import patch
 
 BASE = Path(__file__).resolve().parent
 MODEL_VARIANTS = ("n", "s", "m", "l", "x")
-# 文件名保留标称尺寸，引擎实际输入需要向上对齐到 ALIGN 的倍数。
+# 文件名沿用标称尺寸，引擎实际输入需要向上对齐到 ALIGN 的倍数。
 ALIGN = 32
-# 顺序为（高，宽）。标称高度最高 1080；更高分辨率不再预生成。
-widescreen = [
-    (720, 1280),
-    (1080, 1920),
-    (480, 854),     # 16:9 480p（手机端常用尺寸）
-    (960, 1706),    # 16:9 960p（按高度 960 换算，宽取最近偶数）
-]
-standard_43 = [
-    (480, 640),
-    (720, 960),
-    (960, 1280),
-    (1080, 1440),
-]
-all_sizes = widescreen + standard_43
+# YOLO26 的原生训练分辨率（正方形）。640 已是 ALIGN 的倍数，无需补齐。
+NATIVE_SIZE = 640
+
+
+def parse_size(value):
+    """解析 --size：单个整数表示正方形，或 宽x高；返回 (宽, 高)。"""
+    parts = str(value).strip().lower().replace('*', 'x').split('x')
+    if len(parts) == 1:
+        parts *= 2
+    try:
+        width, height = (int(part) for part in parts)
+    except ValueError:
+        # 数量不对或含非数字，都归为同一条提示。
+        raise ValueError('尺寸需为单个整数或 宽x高，例如 640 或 640x640') from None
+    if min(width, height) <= 0:
+        raise ValueError('尺寸必须大于 0')
+    return width, height
 
 
 def input_size(width, height):
@@ -235,6 +240,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--models", nargs="+", choices=MODEL_VARIANTS,
                         help="指定 YOLO26 型号（如 m l x）；省略时发现脚本目录中已有的对应 .pt 权重")
+    parser.add_argument("--size", default=str(NATIVE_SIZE),
+                        help=f"导出尺寸：单个整数或 宽x高（默认 {NATIVE_SIZE}，即 YOLO26 原生训练分辨率）")
     parser.add_argument("--overwrite", action="store_true", help="重新导出并覆盖已有目标引擎")
     parser.add_argument("--list", action="store_true", help="只列出导出档位，不加载模型或使用 GPU")
     parser.add_argument("--check-env", action="store_true", help="检查 CUDA 13 环境并运行小型 GPU 推理，不导出引擎")
@@ -262,42 +269,41 @@ def main():
             export_one(height, width, overwrite=args.overwrite, workspace=args.workspace,
                        temp_parent=args.worker_dir, variant=variant)
         return
+    try:
+        size_w, size_h = parse_size(args.size)
+    except ValueError as exc:
+        parser.error(str(exc))
+    input_w, input_h = input_size(size_w, size_h)
     variants = list(dict.fromkeys(args.models)) if args.models else [
         variant for variant in MODEL_VARIANTS if (BASE / f"yolo26{variant}.pt").is_file()
     ]
     if args.list:
-        # 无本地权重时也能查看全部支持档位，不加载 GPU 依赖或下载文件。
+        # 无本地权重时也能查看全部支持型号，不加载 GPU 依赖或下载文件。
         for variant in variants or MODEL_VARIANTS:
             weights_state = "权重就绪" if (BASE / f"yolo26{variant}.pt").is_file() else "需自备权重"
-            for h, w in all_sizes:
-                input_w, input_h = input_size(w, h)
-                name = f"yolo26{variant}_{w}x{h}.engine"
-                state = "已存在" if (BASE / name).exists() else "待导出"
-                print(f"{name}：标称 {w}×{h}，输入 {input_w}×{input_h} · {state} · {weights_state}")
+            name = f"yolo26{variant}_{size_w}x{size_h}.engine"
+            state = "已存在" if (BASE / name).exists() else "待导出"
+            print(f"{name}：标称 {size_w}×{size_h}，输入 {input_w}×{input_h} · {state} · {weights_state}")
         return
     pending = []
     skipped = 0
     for variant in variants:
-        for h, w in all_sizes:
-            name = f"yolo26{variant}_{w}x{h}.engine"
-            if (BASE / name).exists() and not args.overwrite:
-                print(f"[跳过] 已存在：{name}；需要重新导出时使用 --overwrite", flush=True)
-                skipped += 1
-                continue
-            pending.append((variant, h, w))
+        name = f"yolo26{variant}_{size_w}x{size_h}.engine"
+        if (BASE / name).exists() and not args.overwrite:
+            print(f"[跳过] 已存在：{name}；需要重新导出时使用 --overwrite", flush=True)
+            skipped += 1
+            continue
+        pending.append(variant)
     if variants and not args.check_env and not pending:
-        print(f"完成：{len(variants)} 种型号，共 {len(variants) * len(all_sizes)} 档，"
-              f"跳过已存在 {skipped} 档。")
+        print(f"完成：{len(variants)} 个型号（{size_w}×{size_h}），跳过已存在 {skipped} 个。")
         return
     if not args.check_env:
         if not variants:
             parser.error("未找到本地检测权重；请将自备的 yolo26n/s/m/l/x.pt 放在脚本目录，"
                          "也可用 --models 指定要导出的型号。脚本不会自动下载")
-        # 先检查所有需要构建的型号，避免跑完部分档位后才发现缺少权重。
-        missing = [f"yolo26{variant}.pt" for variant in variants
-                   if not (BASE / f"yolo26{variant}.pt").is_file()
-                   and any(pending_variant == variant
-                           for pending_variant, _, _ in pending)]
+        # 先检查所有需要构建的型号，避免跑完部分型号后才发现缺少权重。
+        missing = [f"yolo26{variant}.pt" for variant in pending
+                   if not (BASE / f"yolo26{variant}.pt").is_file()]
         if missing:
             parser.error("缺少自备权重：" + "、".join(missing))
 
@@ -312,18 +318,18 @@ def main():
     if args.check_env:
         return
     failed = []
-    for variant, h, w in pending:
-        name = f"yolo26{variant}_{w}x{h}.engine"
-        code = run_worker(h, w, args.overwrite, args.workspace, variant)
+    for variant in pending:
+        name = f"yolo26{variant}_{size_w}x{size_h}.engine"
+        code = run_worker(size_h, size_w, args.overwrite, args.workspace, variant)
         if code == 0:
             continue
         hint = "（可能被 OOM 或外部信号终止，请检查系统内存和显存）" if code in (137, -9) else ""
-        failed.append(f"yolo26{variant} {w}×{h}")
+        failed.append(f"yolo26{variant} {size_w}×{size_h}")
         print(f"[失败] {name}：子进程退出码 {code}{hint}", flush=True)
     if failed:
-        raise SystemExit("以下档位导出失败：" + "、".join(failed))
-    print(f"完成：{len(variants)} 种型号，共 {len(variants) * len(all_sizes)} 档，跳过已存在 {skipped} 档。"
-          "重启 app_ws-multi.py 后可在图片 / 视频页面选择。")
+        raise SystemExit("以下型号导出失败：" + "、".join(failed))
+    print(f"完成：{len(pending)} 个型号（{size_w}×{size_h}），跳过已存在 {skipped} 个。"
+          "重启 app_ws-multi.py 后生效。")
 
 
 if __name__ == "__main__":
