@@ -923,12 +923,17 @@ def install_webrtc(app, get_pool):
         policy = value.get('queue_policy', 'fifo')
         if policy not in ('fifo', 'latest'):
             raise ValueError('无效实时队列策略')
+        # cpu：只用软件解码；nvdec：只用硬件解码且失败不回退；auto：优先硬件，失败回退软件。
+        decoder = value.get('decoder', 'auto')
+        if decoder not in ('auto', 'nvdec', 'cpu'):
+            raise ValueError('无效解码器选择')
         bitrate = max(500000, min(50000000, int(value.get('bitrate', 8000000))))
         fps = int(value.get('fps', 60))
         if fps not in (10, 15, 20, 24, 25, 30, 40, 45, 50, 60):
             raise ValueError('无效帧率')
         return dict(fps=fps, engine=engine, conf=conf, revision=int(value.get('revision', 0)),
-                    width=width, height=height, render=render, bitrate=bitrate, queue_policy=policy)
+                    width=width, height=height, render=render, bitrate=bitrate,
+                    queue_policy=policy, decoder=decoder)
 
     def http_request(url, method, data=None):
         request = urllib.request.Request(url, data=data, method=method,
@@ -987,7 +992,12 @@ def install_webrtc(app, get_pool):
                             pass
         decode_opened_at = time.perf_counter()
         deadline = time.monotonic() + 20
-        hardware, first, fallback = True, True, ''
+        with session['lock']:
+            mode = session['config'].get('decoder', 'auto')
+        # cpu：只用软件解码；nvdec：只用硬件解码且失败不回退；auto：优先硬件，失败回退软件。
+        hardware = mode != 'cpu'
+        allow_fallback = mode == 'auto'
+        first, fallback = True, ''
         startup_invalid_retries = 0
         while not stop.is_set():
             container = None
@@ -1003,8 +1013,8 @@ def install_webrtc(app, get_pool):
                                              'reorder_queue_size': '0'}, timeout=(3., 3.), **kwargs)
                 stream = container.streams.video[0]
                 if not hardware:
-                    stream.thread_type = 'SLICE'
-                    stream.codec_context.thread_count = 2
+                    # 多线程软件解码。此前用 SLICE + 2 线程，1080p 实测仅约 110 FPS。
+                    stream.thread_type = 'AUTO'
                 for frame in container.decode(stream):
                     if stop.is_set():
                         return
@@ -1017,7 +1027,7 @@ def install_webrtc(app, get_pool):
                     if first:
                         session['decoder_startup_ms'] = round((time.perf_counter()-decode_opened_at)*1000, 2)
                         print(f"[webrtc:{session['id'][:8]}] first frame: "
-                              f"decoder={'NVDEC' if hardware else 'CPU'}, "
+                              f"decoder={'NVDEC' if hardware else 'CPU'} (mode={mode}), "
                               f"size={frame.width}x{frame.height}, "
                               f"startup_ms={session['decoder_startup_ms']}, "
                               f"fallback={fallback or 'none'}", flush=True)
@@ -1047,8 +1057,8 @@ def install_webrtc(app, get_pool):
                     print(f"[webrtc:{session['id'][:8]}] retry startup NVDEC once", flush=True)
                     stop.wait(.3)
                     continue
-                if hardware and (container is not None or isinstance(exc, ImportError)
-                                 or time.monotonic() >= deadline - 10):
+                if hardware and allow_fallback and (container is not None or isinstance(exc, ImportError)
+                                                    or time.monotonic() >= deadline - 10):
                     hardware = False
                     fallback = str(exc)[:200]
                     print(f"[webrtc:{session['id'][:8]}] switching to CPU: {fallback}", flush=True)
@@ -1360,6 +1370,8 @@ HTML = r'''
   <label>传输<select id="liveTransport"><option value="jpeg">JPEG（原通道）</option><option value="webrtc">WebRTC（MediaMTX）</option></select></label>
   <label>画框位置<select id="liveRender"><option value="client" selected>客户端画框</option><option value="server">服务器画框（同帧）</option></select></label>
   <label>WebRTC 队列<select id="rtcQueue"><option value="fifo" selected>顺序处理（保留待处理帧）</option><option value="latest">低延迟（丢弃待处理旧帧）</option></select></label>
+  <label>JPEG 队列<select id="jpegQueue"><option value="fifo" selected>顺序处理（保留待处理帧）</option><option value="latest">低延迟（丢弃待处理旧帧）</option></select></label>
+  <label>WebRTC 解码<select id="liveDecoder"><option value="auto" selected>自动（优先 NVDEC，失败回退 CPU）</option><option value="nvdec">仅 NVDEC（失败不回退）</option><option value="cpu">仅 CPU（多线程软解）</option></select></label>
   <label>摄像头目标帧率<select id="rtcFps"><option value="10">10 FPS</option><option value="15">15 FPS</option><option value="20">20 FPS</option><option value="24">24 FPS</option><option value="25">25 FPS</option><option value="30">30 FPS</option><option value="40">40 FPS</option><option value="45">45 FPS</option><option value="50">50 FPS</option><option value="60" selected>60 FPS</option></select></label>
   <label>WebRTC码率上限<select id="rtcBitrate"><option value="500000">0.5 Mbps</option><option value="1000000">1 Mbps</option><option value="1500000">1.5 Mbps</option><option value="2000000">2 Mbps</option><option value="3000000">3 Mbps</option><option value="4000000">4 Mbps</option><option value="6000000">6 Mbps</option><option value="8000000" selected>8 Mbps</option><option value="10000000">10 Mbps</option><option value="12000000">12 Mbps</option><option value="16000000">16 Mbps</option><option value="20000000">20 Mbps</option><option value="25000000">25 Mbps</option><option value="30000000">30 Mbps</option><option value="40000000">40 Mbps</option><option value="50000000">50 Mbps</option></select></label>
   <span class="hint">分辨率优先；码率是上限，实际帧率受设备与带宽限制。服务器画框回传使用同一档码率目标。</span>
@@ -1830,7 +1842,7 @@ function receiveLiveResult(event,generation){
  const ms=value=>Number.isFinite(value)?value.toFixed(1)+'ms':'—';
  const roundtrip=Number.isFinite(data.sent_at)?now-data.sent_at:NaN;
  const transport=Number.isFinite(data.server_total_ms)?Math.max(0,roundtrip-data.server_total_ms):NaN;
- message('liveStatus',`${liveGeometry?.aspectLabel||$('liveAspect').value} · ${data.width}×${data.height} · JPEG ${Number.isFinite(data.jpeg_quality)?Math.round(data.jpeg_quality*100):'—'}% · ${Math.round(data.jpeg_bytes/1024)} KB\n截图 ${ms(data.draw_ms)} · JPEG 编码 ${ms(data.encode_ms)} · 截图→结果 ${ms(age)}\n发送→结果 ${ms(roundtrip)} · 传输与客户端调度估计 ${ms(transport)} · 发送前积压 ${Math.round((data.buffered_bytes||0)/1024)} KB\n服务器总耗时 ${ms(data.server_total_ms)}（排队 ${ms(data.queue_ms)} + 处理 ${ms(data.server_process_ms)}）\n${data.engine} · 解码/预处理 ${ms(data.decode_ms)} (${data.decoder||'CPU'}) · GPU 锁等待 ${ms(data.wait_ms)} · 预测调用 ${ms(data.infer_ms)}\n${(received/Math.max(elapsed,.01)).toFixed(1)} 检测 FPS · 顺序处理 · 当前待处理 ${data.pending_frames??0}/${data.queue_capacity??4} 帧`);
+ message('liveStatus',`${liveGeometry?.aspectLabel||$('liveAspect').value} · ${data.width}×${data.height} · JPEG ${Number.isFinite(data.jpeg_quality)?Math.round(data.jpeg_quality*100):'—'}% · ${Math.round(data.jpeg_bytes/1024)} KB\n截图 ${ms(data.draw_ms)} · JPEG 编码 ${ms(data.encode_ms)} · 截图→结果 ${ms(age)}\n发送→结果 ${ms(roundtrip)} · 传输与客户端调度估计 ${ms(transport)} · 发送前积压 ${Math.round((data.buffered_bytes||0)/1024)} KB\n服务器总耗时 ${ms(data.server_total_ms)}（排队 ${ms(data.queue_ms)} + 处理 ${ms(data.server_process_ms)}）\n${data.engine} · 解码/预处理 ${ms(data.decode_ms)} (${data.decoder||'CPU'}) · GPU 锁等待 ${ms(data.wait_ms)} · 预测调用 ${ms(data.infer_ms)}\n${(received/Math.max(elapsed,.01)).toFixed(1)} 检测 FPS · ${data.queue_policy==='latest'?`低延迟（已丢弃 ${data.replaced??0} 帧）`:'顺序处理'} · 当前待处理 ${data.pending_frames??0}/${data.queue_capacity??4} 帧`);
  const settings=cameraStream?.getVideoTracks()[0]?.getSettings();
  if(data.render==='server')$('liveStatus').textContent+=`\n服务器画框 ${ms(data.server_draw_ms)} · 回传 JPEG 编码 ${ms(data.server_encode_ms)} · 回传 ${Math.round(data.return_bytes/1024)} KB · 同帧标注`;
  $('liveStatus').textContent+=`\n实际发送 ${(liveSentCount/Math.max(elapsed,.01)).toFixed(1)} FPS · 摄像头协商 ${settings?.frameRate?.toFixed(1)??'—'} FPS（非实测采集率）\n${encoderLabel} · 缓冲阈值 ${Math.round(bufferLimit()/1024)} KB\n${cameraRequestLabel} · 视频帧 ${$('cameraVideo').videoWidth}×${$('cameraVideo').videoHeight}`;
@@ -1948,7 +1960,8 @@ async function sendCapture(){
   // 不设置未确认帧计数或确认应答门槛，每张 JPEG 都随附对应元数据。
   connection.send(JSON.stringify({type:'frame',id,revision,captured_at:capturedAt,
    sent_at:performance.now(),draw_ms:drawMs,encode_ms:encodeMs,
-   jpeg_quality:quality,buffered_bytes:connection.bufferedAmount,engine,conf,render:$('liveRender').value}));
+   jpeg_quality:quality,buffered_bytes:connection.bufferedAmount,engine,conf,render:$('liveRender').value,
+   queue_policy:$('jpegQueue').value}));
   connection.send(blob); // WebSocket 可直接发送 Blob，省去复制到 ArrayBuffer 的步骤。
   liveSentCount++;
   if(!firstSentAt)firstSentAt=performance.now();
@@ -2024,11 +2037,15 @@ async function configureRtcSender(sender){
  catch(error){
   preference=false;
   try{await apply(false);}
-  catch(second){rtcSenderNote='浏览器拒绝所选帧率发送参数：'+second.message;return;}
+  catch(second){rtcSenderNote=`⚠️ 发送参数未生效（浏览器拒绝），编码器改用默认码率与帧率：${second.message}`;return;}
  }
+ // 回读浏览器实际接受的值：确认码率上限究竟有没有生效。
  const actual=sender.getParameters();
+ const enc=actual.encodings?.[0]??{};
+ const limits=`${Number.isFinite(enc.maxBitrate)?(enc.maxBitrate/1e6).toFixed(2)+' Mbps':'码率未回报'} / `
+   +`${enc.maxFramerate??'帧率未回报'} FPS`;
  const confirmed=actual.degradationPreference==='maintain-resolution';
- rtcSenderNote=`发送帧率上限 ${actual.encodings?.[0]?.maxFramerate??'浏览器未回报'} FPS · ${confirmed?'分辨率优先（带宽不足时可能降帧率）':preference?'已请求分辨率优先，浏览器未确认':'浏览器使用默认自适应策略'}`;
+ rtcSenderNote=`发送上限 ${limits} · ${confirmed?'分辨率优先（带宽不足时可能降帧率）':preference?'已请求分辨率优先，浏览器未确认':'浏览器使用默认自适应策略'}`;
 }
 let rtcPlayback=null,rtcPlaybackStatus='等待服务器标注流';
 function stopRtcPlayback(){
@@ -2133,16 +2150,17 @@ function stopRtc(){
 }
 function syncRtcConfig(){
  if(liveGeometry&&rtcChannel?.readyState===WebSocket.OPEN&&rtcRevision!==liveRevision){
-  rtcChannel.send(JSON.stringify({type:'config',revision:liveRevision,engine:$('liveEngine').value,conf:confidence('liveConf'),width:liveGeometry.width,height:liveGeometry.height,render:$('liveRender').value,bitrate:Number($('rtcBitrate').value),fps:rtcTargetFps(),queue_policy:$('rtcQueue').value}));
+  rtcChannel.send(JSON.stringify({type:'config',revision:liveRevision,engine:$('liveEngine').value,conf:confidence('liveConf'),width:liveGeometry.width,height:liveGeometry.height,render:$('liveRender').value,bitrate:Number($('rtcBitrate').value),fps:rtcTargetFps(),queue_policy:$('rtcQueue').value,decoder:$('liveDecoder').value}));
   rtcRevision=liveRevision;
  }
 }
 function updateTransportControls(){
  const rtc=$('liveTransport').value==='webrtc';
- for(const id of ['quality','jpegMode','bufferMode'])$(id).disabled=rtc;
+ for(const id of ['quality','jpegMode','bufferMode','jpegQueue'])$(id).disabled=rtc;
  $('rtcBitrate').disabled=!rtc;
  $('rtcFps').disabled=false;
  $('rtcQueue').disabled=!rtc;
+ $('liveDecoder').disabled=!rtc;
  updateResultSurface();
 }
 $('liveTransport').onchange=()=>{if(cameraStream)stopLive();updateTransportControls();};
@@ -2150,6 +2168,7 @@ updateTransportControls();
 $('rtcFps').onchange=()=>{if(cameraStream)void startLive();};
 $('rtcBitrate').onchange=()=>{if(cameraStream&&rtcPeer)void startLive();};
 $('rtcQueue').onchange=()=>{if(cameraStream&&rtcPeer)void startLive();};
+$('liveDecoder').onchange=()=>{if(cameraStream&&rtcPeer)void startLive();};
 function iceReady(peer){
  if(peer.iceGatheringState==='complete')return Promise.resolve();
  return new Promise((resolve,reject)=>{
@@ -2226,7 +2245,7 @@ async function startRtc(stream,generation){
  let answer;const signalingStarted=performance.now();
  try{
   answer=await jsonResponse(await fetch('/api/webrtc/offer',{method:'POST',headers:{'Content-Type':'application/json'},signal:controller.signal,
-   body:JSON.stringify({sdp:peer.localDescription.sdp,type:peer.localDescription.type,config:{engine:$('liveEngine').value,conf:confidence('liveConf'),revision:liveRevision,width:liveGeometry.width,height:liveGeometry.height,render:$('liveRender').value,bitrate:Number($('rtcBitrate').value),fps:rtcTargetFps(),queue_policy:$('rtcQueue').value}})}));
+   body:JSON.stringify({sdp:peer.localDescription.sdp,type:peer.localDescription.type,config:{engine:$('liveEngine').value,conf:confidence('liveConf'),revision:liveRevision,width:liveGeometry.width,height:liveGeometry.height,render:$('liveRender').value,bitrate:Number($('rtcBitrate').value),fps:rtcTargetFps(),queue_policy:$('rtcQueue').value,decoder:$('liveDecoder').value}})}));
  }finally{clearTimeout(timeout);if(rtcFetch===controller)rtcFetch=null;}
  if(generation!==liveGeneration){void fetch('/api/webrtc/'+answer.session_id,{method:'DELETE'}).catch(()=>{});return;}
  rtcSignalingMs=performance.now()-signalingStarted;
@@ -2631,15 +2650,17 @@ def process_live_frame(raw, config):
 async def realtime(websocket: WebSocket):
     await websocket.accept()
     await websocket.send_json(dict(type='init'))
-    # 服务端按入队顺序处理已接收帧；浏览器采集与显示端仍可能跳过画面。
-    # 当推理速度跟不上输入时，
-    # 有界队列通过等待入队向接收端传递背压。
+    # fifo：按入队顺序处理已接收帧；推理跟不上输入时，有界队列通过等待入队传递背压。
+    # latest：丢弃尚未处理的旧帧，只保留最新画面以降低端到端延迟。
+    # 浏览器采集与显示端仍可能跳过画面。
     pending_frames = asyncio.Queue(maxsize=4)
+    replaced = 0
     # 每连接固定工作线程及解码器，避免默认线程池切换和多连接争用同一解码锁。
     jpeg_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='jpeg-process')
     pipeline = RealtimePipeline(pool)
 
     async def receive_frames():
+        nonlocal replaced
         config = None
         while True:
             message = await websocket.receive()
@@ -2651,6 +2672,10 @@ async def realtime(websocket: WebSocket):
                     raise ValueError('无效的帧配置')
                 if not isinstance(value.get('id'), int) or not isinstance(value.get('revision'), int):
                     raise ValueError('帧编号或画幅版本无效，请刷新网页')
+                policy = value.get('queue_policy', 'fifo')
+                if policy not in ('fifo', 'latest'):
+                    raise ValueError('无效实时队列策略')
+                value['policy'] = policy
                 config = value
             elif message.get('bytes') is not None:
                 current, config = config, None
@@ -2659,7 +2684,17 @@ async def realtime(websocket: WebSocket):
                 raw = message['bytes']
                 if len(raw) > 20 * 1024 * 1024:
                     raise ValueError('实时 JPEG 过大，请降低采集分辨率')
-                await pending_frames.put((raw, current, time.perf_counter()))
+                if current['policy'] == 'latest':
+                    # 低延迟：清空尚未处理的旧帧，只保留最新画面。
+                    while True:
+                        try:
+                            pending_frames.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        replaced += 1
+                    pending_frames.put_nowait((raw, current, time.perf_counter()))
+                else:
+                    await pending_frames.put((raw, current, time.perf_counter()))
 
     async def infer_fifo():
         while True:
@@ -2675,7 +2710,8 @@ async def realtime(websocket: WebSocket):
                           encode_ms=config.get('encode_ms'), jpeg_quality=config.get('jpeg_quality'),
                           buffered_bytes=config.get('buffered_bytes'),
                           jpeg_bytes=len(raw), pending_frames=pending_frames.qsize(),
-                          queue_capacity=pending_frames.maxsize,
+                          queue_policy=config.get('policy', 'fifo'), replaced=replaced,
+                          queue_capacity=1 if config.get('policy') == 'latest' else pending_frames.maxsize,
                           server_process_ms=round((completed - started) * 1000, 2),
                           server_total_ms=round((completed - arrived) * 1000, 2),
                           queue_ms=round((started - arrived) * 1000, 2))
