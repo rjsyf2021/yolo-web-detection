@@ -147,7 +147,7 @@ def run_stage(stage, directory, height, width, workspace=None, variant="s"):
                "--models", variant]
     if workspace is not None:
         command += ["--workspace", str(workspace)]
-    completed = subprocess.run(command)
+    completed = subprocess.run(command, check=False)
     if completed.returncode:
         raise RuntimeError(f"{stage} 阶段失败（{width}×{height}），退出码 {completed.returncode}；"
                            "目标引擎未替换")
@@ -250,7 +250,7 @@ def run_worker(height, width, overwrite=False, workspace=None, variant="s"):
     # 父进程只拥有并清理本次创建的目录；子进程被杀死后也能清理，不扫描其他任务的目录。
     with tempfile.TemporaryDirectory(prefix=".yolo-export-worker-", dir=BASE) as directory:
         command += ["--worker-dir", directory]
-        return subprocess.run(command).returncode
+        return subprocess.run(command, check=False).returncode
 
 
 def main():

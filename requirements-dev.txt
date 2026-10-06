@@ -1,0 +1,3 @@
+-r requirements.txt
+# Keep local lint runs reproducible without installing the GPU/export toolchain.
+pylint==4.0.5

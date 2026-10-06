@@ -52,8 +52,11 @@ class VideoTimestampTests(unittest.TestCase):
                      if isinstance(node, ast.FunctionDef) and node.name in names]
         if {node.name for node in functions} != names:
             raise AssertionError('媒体函数入口发生变化，请更新测试加载器')
-        namespace = dict(globals(), cv2=cv2, np=np)
-        exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), 'exec'), namespace)
+        namespace = dict(globals(), cv2=cv2, np=np, deque=deque, ThreadPoolExecutor=ThreadPoolExecutor,
+                         contextmanager=contextmanager, Fraction=Fraction, math=math, os=os,
+                         queue=queue, threading=threading, time=time)
+        # Only execute selected functions from the checked-in application, never user input.
+        exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), 'exec'), namespace)  # pylint: disable=exec-used
         cls.process_video = staticmethod(namespace['process_video'])
 
     def check_timeline(self, video_start, audio_offset):

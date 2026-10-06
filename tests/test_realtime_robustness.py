@@ -30,15 +30,17 @@ def load_functions(*names):
                      'JOB_RETENTION_SECONDS', 'JOB_CLEANUP_MAX_FAILURES',
                      'WS_SEND_TIMEOUT_SECONDS', 'WS_CLOSE_TIMEOUT_SECONDS',
                  } for target in node.targets)]
-    namespace = dict(globals(), WebSocket=object, WebSocketDisconnect=ConnectionError)
-    exec(compile(ast.Module(body=constants + functions, type_ignores=[]), str(SOURCE), 'exec'), namespace)
+    namespace = dict(globals(), WebSocket=object, WebSocketDisconnect=ConnectionError,
+                     ThreadPoolExecutor=ThreadPoolExecutor, math=math)
+    # Only execute selected functions from the checked-in application, never user input.
+    exec(compile(ast.Module(body=constants + functions, type_ignores=[]), str(SOURCE), 'exec'), namespace)  # pylint: disable=exec-used
     return namespace
 
 
 class FrameRateTests(unittest.TestCase):
     def test_configuration(self):
         namespace = load_functions('configuration')
-        namespace['get_pool'] = lambda: type('Pool', (), {'engines': {'test': {}}})()
+        namespace['get_pool'] = Mock(return_value=Mock(engines={'test': {}}))
         config = dict(engine='test', width=640, height=480)
         configure = namespace['configuration']
         self.assertEqual(configure(config)['fps'], 60)

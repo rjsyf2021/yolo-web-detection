@@ -1,0 +1,20 @@
+[MAIN]
+py-version=3.10
+persistent=no
+
+[TYPECHECK]
+# GPU/export dependencies are supplied by the deployment environment, not CPU CI.
+# OpenCV and PyAV expose dynamic extension APIs that static inference cannot resolve.
+# Keep import/member checks enabled for other modules and project code.
+ignored-modules=torch,ultralytics,onnx,onnxruntime,tensorrt,modelopt,nvidia,cv2,av
+
+[MESSAGES CONTROL]
+# CI checks correctness (E/F/W); the standalone app embeds HTML/JS and intentionally
+# uses long pipeline functions. Formatting and refactoring suggestions are not gates.
+disable=C,R,
+    broad-exception-caught,
+    redefined-outer-name,
+    unused-argument,
+    global-statement
+# Broad catches isolate individual jobs/sessions and optional codec fallbacks.
+# Callback arguments, local names and the lifespan-owned pool are intentional.

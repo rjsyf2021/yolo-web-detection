@@ -13,7 +13,8 @@ import export_all_engines as exporter
 
 class ExportTests(unittest.TestCase):
     def setUp(self):
-        self.directory = tempfile.TemporaryDirectory()
+        # unittest cleanup owns this directory across setUp and the test method.
+        self.directory = tempfile.TemporaryDirectory()  # pylint: disable=consider-using-with
         self.addCleanup(self.directory.cleanup)
         self.base = Path(self.directory.name)
         self.base_patch = patch.object(exporter, 'BASE', self.base)
@@ -130,7 +131,7 @@ class ExportTests(unittest.TestCase):
     def test_stage_failure_preserves_old_engine_and_cleans_temp_files(self):
         for failed_stage in ('onnx', 'reference', 'engine'):
             with self.subTest(stage=failed_stage):
-                def stage(name, directory, *args):
+                def stage(name, directory, *args, failed_stage=failed_stage):
                     self.stage(name, directory, *args)
                     if name == failed_stage:
                         raise RuntimeError('stage failed')

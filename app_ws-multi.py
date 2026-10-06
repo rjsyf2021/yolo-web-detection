@@ -38,6 +38,7 @@ class EnginePool:
         self.parallel_disabled = False
         self.cache_size = max(1, cache_size)
         self.engines = {}
+        self.warmup_report = None
         for path in sorted(Path(directory).glob('*.engine')):
             match = re.fullmatch(r'yolo26([nsmxl])_(\d+)x(\d+)\.engine', path.name)
             if not match:
@@ -154,7 +155,7 @@ class EnginePool:
         stream.synchronize()
         free_after, _ = torch.cuda.mem_get_info()
         self.replica_bytes[engine['key']] = max(self.replica_bytes.get(engine['key'], 0),
-                                                max(0, free_before - free_after))
+                                                0, free_before - free_after)
         return dict(model=model, stream=stream, busy=False)
 
     def prepare_parallel(self):
@@ -318,25 +319,18 @@ class EnginePool:
         return (result if defer_plot else drawn), detections, dict(infer_ms=round(infer_ms, 2), wait_ms=round(wait_ms, 2), draw_ms=round(draw_ms, 2))
 
 
-"""完整文件上传流水线：服务器解码 → YOLO 推理 → 服务器画框。
-
-视频采用源文件的显示时间戳（PTS），不以处理速度或实时采集帧率决定播放速度。
-"""
+# 完整文件上传流水线：服务器解码 → YOLO 推理 → 服务器画框。
+#
+# 视频采用源文件的显示时间戳（PTS），不以处理速度或实时采集帧率决定播放速度。
 from fractions import Fraction
-from pathlib import Path
-import math
-import os
 import shutil
 import subprocess
-import time
 import queue
-import threading
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
 import cv2
-import numpy as np
 
 
 # 图片处理保持原图输出尺寸；进度回调也用于检查任务是否被取消。
@@ -667,13 +661,8 @@ def process_video(source, target, pool, options, progress):
                 infer_ms=round(infer_total / max(count, 1), 2), elapsed=round(elapsed, 2))
 
 
-"""实时 JPEG 解码与推理，独立于文件处理流水线。"""
-import threading
-import time
+# 实时 JPEG 解码与推理，独立于文件处理流水线。
 
-import cv2
-import numpy as np
-import torch
 import torch.nn.functional as functional
 
 try:
@@ -814,20 +803,11 @@ class RealtimePipeline:
                     decode_ms=round(decode_ms, 2), decoder=decoder_name, **timing)
 
 
-"""WHIP 信令与本地 RTSP 接收流程，独立于 JPEG 通道，不依赖 aiortc。"""
+# WHIP 信令与本地 RTSP 接收流程，独立于 JPEG 通道，不依赖 aiortc。
 import asyncio
-import math
-import os
-import queue
-import threading
-import time
 import uuid
 import urllib.request
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor
-from fractions import Fraction
-import cv2
-import numpy as np
 from fastapi import HTTPException, WebSocket
 
 
@@ -836,6 +816,10 @@ class AnnotatedRTSPPublisher:
     def __init__(self, base, path):
         self.base, self.path = base, path
         self.output = None
+        self.output_path = None
+        self.stream = None
+        self.origin = None
+        self.last_pts = -1
         self.epoch = 0
         self.shape = None
         self.codec = None
@@ -2335,30 +2319,19 @@ async function startRtc(stream,generation){
 
 '''
 
-"""YOLO 双流水线服务器，在 GPU 服务器运行：python app_ws-multi.py。
-
-检测逻辑、媒体流水线与网页已内嵌在本文件中，无需额外的拆分模块。
-ENGINE_DIR 默认指向脚本目录，可通过环境变量指定已有引擎的存放目录。
-"""
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
+# YOLO 双流水线服务器，在 GPU 服务器运行：python app_ws-multi.py。
+#
+# 检测逻辑、媒体流水线与网页已内嵌在本文件中，无需额外的拆分模块。
+# ENGINE_DIR 默认指向脚本目录，可通过环境变量指定已有引擎的存放目录。
 from contextlib import asynccontextmanager
-from pathlib import Path
 import json
-import os
-import shutil
 import tempfile
 import fcntl
 import hashlib
 import stat
-import threading
-import time
 import traceback
-import uuid
 
-import cv2
-import numpy as np
-from fastapi import FastAPI, Body, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Body, File, Form, UploadFile, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse
 import uvicorn
 
@@ -2817,12 +2790,12 @@ async def realtime(websocket: WebSocket):
                 config = value
             elif message.get('bytes') is not None:
                 current, config = config, None
-                if current is None:
+                if not isinstance(current, dict):
                     raise ValueError('缺少帧配置')
                 raw = message['bytes']
                 if len(raw) > 20 * 1024 * 1024:
                     raise ValueError('实时 JPEG 过大，请降低采集分辨率')
-                if current['policy'] == 'latest':
+                if current.get('policy') == 'latest':
                     # 低延迟：清空尚未处理的旧帧，只保留最新画面。
                     while True:
                         try:

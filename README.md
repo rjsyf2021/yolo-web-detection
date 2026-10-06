@@ -268,6 +268,15 @@ python benchmark_fps.py --image /path/to/sample.jpg --source-sizes original --re
 
 ### 回归测试
 
+静态检查使用仓库根目录的 `.pylintrc`，可在独立的 CPU 虚拟环境运行：
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m pylint $(git ls-files '*.py')
+```
+
+CI 以错误和警告检查为准，命名、行长、文档字符串和复杂度等风格建议不作为阻断条件。仅对部署环境提供的 GPU/导出依赖及 OpenCV、PyAV 动态接口设置模块级例外；其他导入、未定义变量、项目代码成员及语法错误仍会使检查失败。会话异常隔离、回调参数和 lifespan 管理的全局池另有明确例外。CI 不应使用 `--exit-zero` 或 `continue-on-error` 隐藏检查失败。
+
 在仓库根目录运行：
 
 ```bash
