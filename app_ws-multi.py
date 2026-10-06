@@ -22,6 +22,12 @@ INFERENCE_SIZE = 640
 
 # 实例池：管理锁只负责分配；每个实例独占使用，不同实例可并行预测。
 class EnginePool:
+    """按模型缓存独立预测器；禁止两个线程同时使用同一预测器。
+
+    available 只保护实例列表和 busy 标志，预测期间不持有管理锁。
+    每个实例拥有独立 CUDA 流；归还前必须完成输出复制与流同步。
+    cache_size 限制模型种类数，replica_limit 限制每种模型的实例数。
+    """
     def __init__(self, directory, cache_size=3):
         self.lock = threading.RLock()
         self.available = threading.Condition(self.lock)
@@ -130,6 +136,7 @@ class EnginePool:
 
     def allocation_budget(self, engine):
         # 使用真实设备空闲显存（包含 TensorRT 分配），并给测得常驻量留余量。
+        # 文件大小与实测增量只是估算，不是硬上限，也无法预留其他进程的显存。
         return max(512 * 1024**2, Path(engine['path']).stat().st_size * 3,
                    int(self.replica_bytes.get(engine['key'], 0) * 1.5))
 
@@ -139,7 +146,7 @@ class EnginePool:
             raise RuntimeError('显存预算不足（out of memory budget），保留编解码空间')
         model = YOLO(engine['path'], task='detect')
         stream = torch.cuda.Stream(device=0)
-        # 在接收请求之前完成加载、CUDA Graph 初始化和固定输入预热。
+        # 启动时或缓存失效后的重载阶段初始化；调用方保证池内没有正在预测的实例。
         with torch.cuda.stream(stream):
             model.predict(np.zeros((INFERENCE_SIZE, INFERENCE_SIZE, 3), dtype=np.uint8),
                           imgsz=(INFERENCE_SIZE, INFERENCE_SIZE), rect=False, conf=.4,
@@ -153,6 +160,8 @@ class EnginePool:
     def prepare_parallel(self):
         # 只在启动阶段扩容，避免业务推理进行中触发额外模型的 CUDA Graph 捕获。
         with self.available:
+            if self.parallel_disabled:
+                return  # 启动预热已经触发显存降级时，不再创建不会被使用的副本。
             for key, slots in self.cache.items():
                 engine = self.engines[key]
                 while len(slots) < self.replica_limit:
@@ -171,6 +180,11 @@ class EnginePool:
             torch.cuda.empty_cache()
 
     def acquire_replica(self, engine):
+        """借出空闲实例；池满时等待，缓存缺失时仅重建基础实例。
+
+        Condition.wait 会释放管理锁，让其他线程能够归还实例。
+        此处只协调本池的预测调用，不代表整个进程中的 GPU 编解码已暂停。
+        """
         key = engine['key']
         with self.available:
             while True:
@@ -205,6 +219,7 @@ class EnginePool:
                 return slot
 
     def release_replica(self, key, slot, broken=False):
+        """归还实例并唤醒等待者；损坏实例和降级后的闲置副本不再复用。"""
         with self.available:
             slot['busy'] = False
             slots = self.cache.get(key, [])
@@ -217,6 +232,8 @@ class EnginePool:
             self.available.notify_all()
 
     def disable_parallel(self):
+        # 降级持续到进程重启，避免空闲显存上下波动时反复加载副本。
+        # 正在使用的副本由 release_replica 回收，不能在这里直接销毁。
         with self.available:
             self.parallel_disabled = True
             for slots in self.cache.values():
@@ -227,6 +244,7 @@ class EnginePool:
 
     def infer_replica(self, slot, bgr, engine, conf, need_cpu):
         # GPU JPEG 张量由解码线程产生；本实例流显式等待生产流。
+        # infer_ms 包含预处理、预测、后处理与结果搬运，不是纯 TensorRT 执行时间。
         started = time.perf_counter()
         try:
             slot['stream'].wait_stream(torch.cuda.current_stream())
@@ -737,6 +755,8 @@ class RealtimePipeline:
                     engine = self.pool.select(width, height, config.get('engine', 'auto'), 'balanced')
                     ih, iw = engine['input_h'], engine['input_w']
                     scale = min(iw / width, ih / height)
+                    # 张量输入绕过 Ultralytics 的图像预处理，因此这里手动做灰边 LetterBox。
+                    # round(... - .1) 与 Ultralytics 保持一致，奇数补边时左右/上下相差一像素。
                     resized_w, resized_h = max(1, round(width * scale)), max(1, round(height * scale))
                     left = round((iw - resized_w) / 2 - .1)
                     top = round((ih - resized_h) / 2 - .1)
@@ -1627,6 +1647,7 @@ async function runMediaItem(item,generation){
  }
 }
 function pumpMediaQueue(){
+ // ready 表示用户已启动这一项；删除、轮询结束等事件不能激活未开始的其他文件。
  const parallel=Math.max(1,Math.min(4,Number($('mediaParallel').value)||3));
  while(mediaRunning<parallel){
   const item=mediaItems.find(item=>item.state==='pending'&&item.ready&&!item.cancelRequested);
@@ -2317,6 +2338,9 @@ import json
 import os
 import shutil
 import tempfile
+import fcntl
+import hashlib
+import stat
 import threading
 import time
 import traceback
@@ -2326,14 +2350,76 @@ import cv2
 import numpy as np
 from fastapi import FastAPI, Body, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse
-from starlette.background import BackgroundTask
 import uvicorn
 
 
 BASE = Path(__file__).resolve().parent
 ENGINE_DIR = Path(os.environ.get('ENGINE_DIR', BASE))
 JOB_RETENTION_SECONDS = 15 * 60
+
+
+class MediaStorage:
+    """本应用独占的任务目录；进程退出时由系统释放文件锁。
+
+    锁文件必须保留，不能删除后重建，否则新旧进程可能锁住不同的 inode。
+    只在启动前和工作线程退出后清扫；运行中的任务仍按 15 分钟规则清理。
+    """
+
+    def __init__(self, root):
+        self.root = Path(root).absolute()
+        self.lock_fd = None
+
+    def acquire(self):
+        if self.lock_fd is not None:
+            raise RuntimeError('临时目录已被当前实例锁定')
+        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        info = self.root.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o077):
+            raise RuntimeError(f'临时目录必须为当前用户独占的真实目录（权限 700）：{self.root}')
+        fd = os.open(self.root / '.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            raise RuntimeError('另一个应用实例正在使用临时目录，请先停止旧实例') from None
+        except BaseException:
+            os.close(fd)
+            raise
+        self.lock_fd = fd
+
+    def new_directory(self):
+        if self.lock_fd is None:
+            raise RuntimeError('临时目录尚未初始化')
+        directory = self.root / ('job-' + uuid.uuid4().hex)
+        directory.mkdir(mode=0o700)
+        return directory
+
+    def purge_orphans(self):
+        if self.lock_fd is None:
+            raise RuntimeError('未持有目录锁，禁止清理')
+        removed = 0
+        for directory in self.root.iterdir():
+            # 不扫描 /tmp 的旧通配目录，不跟随符号链接，不删除锁文件或未知名称。
+            if (re.fullmatch(r'job-[0-9a-f]{32}', directory.name)
+                    and not directory.is_symlink() and directory.is_dir()):
+                shutil.rmtree(directory)
+                removed += 1
+        if removed:
+            print(f'[media/cleanup] 已清理 {removed} 个遗留任务目录', flush=True)
+
+    def close(self):
+        if self.lock_fd is not None:
+            os.close(self.lock_fd)
+            self.lock_fd = None
+
+
+# 同一用户、同一路径的应用重启后仍定位到同一目录；不同项目副本互不清扫。
+_storage_key = hashlib.sha256(str(Path(__file__).resolve()).encode()).hexdigest()[:16]
+media_storage = MediaStorage(os.environ.get(
+    'MEDIA_TEMP_DIR', str(Path(tempfile.gettempdir()) / f'yolo-media-{os.getuid()}-{_storage_key}')))
 jobs = {}
+# 任务状态、Future 和下载计数共用同一把锁；GPU 推理与上传复制不持有它。
 jobs_lock = threading.Lock()
 media_executor = ThreadPoolExecutor(max_workers=max(1, min(4, int(os.environ.get('MEDIA_WORKERS', '4')))), thread_name_prefix='media')
 pool = None
@@ -2345,10 +2431,12 @@ def cleanup_jobs():
     with jobs_lock:
         expired = [job_id for job_id, job in jobs.items()
                    if job['status'] in ('done', 'error', 'cancelled') and not job.get('readers', 0)
+                   and (job.get('future') is None or job['future'].done())
                    and (job.get('delete_requested')
                         or time.time() - job.get('finished_at', job['updated']) >= JOB_RETENTION_SECONDS)]
         for job_id in expired:
             job = jobs[job_id]
+            # 终态可能先于工作线程收尾，必须等 Future 完成后再删目录和记录。
             # 仅删除本进程创建的任务目录，不使用用户提供的路径。
             try:
                 shutil.rmtree(job['directory'])
@@ -2365,29 +2453,41 @@ def cleanup_jobs():
 @asynccontextmanager
 async def lifespan(app):
     global pool, live_pipeline
-    pool = await asyncio.to_thread(EnginePool, ENGINE_DIR,
-                                   int(os.environ.get('ENGINE_CACHE_SIZE', '3')))
-    await asyncio.to_thread(pool.warm_all, runs=5, keep_all='ENGINE_CACHE_SIZE' not in os.environ)
-    live_pipeline = RealtimePipeline(pool)
-
     async def housekeeping():
         while True:
             await asyncio.sleep(10)
             await asyncio.to_thread(cleanup_jobs)
             await webrtc_reap()
 
-    task = asyncio.create_task(housekeeping())
-    yield
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
-    await webrtc_shutdown()
-    with jobs_lock:
-        for job in jobs.values():
-            if job['status'] not in ('done', 'error', 'cancelled'):
-                job['cancel_requested'] = True
-    await asyncio.to_thread(media_executor.shutdown, wait=True)
-    for job in jobs.values():
-        shutil.rmtree(job['directory'], ignore_errors=True)
+    media_storage.acquire()
+    task = None
+    try:
+        # 先清理再加载模型；即使随后 GPU 初始化失败，也已处理上次崩溃的残留。
+        await asyncio.to_thread(media_storage.purge_orphans)
+        pool = await asyncio.to_thread(EnginePool, ENGINE_DIR,
+                                       int(os.environ.get('ENGINE_CACHE_SIZE', '3')))
+        await asyncio.to_thread(pool.warm_all, runs=5, keep_all='ENGINE_CACHE_SIZE' not in os.environ)
+        live_pipeline = RealtimePipeline(pool)
+        task = asyncio.create_task(housekeeping())
+        yield
+    finally:
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await webrtc_shutdown()
+        finally:
+            with jobs_lock:
+                for job in jobs.values():
+                    if job['status'] not in ('done', 'error', 'cancelled'):
+                        job['cancel_requested'] = True
+            # 必须等处理线程退出再清扫和放锁，避免下一实例删除仍在写入的文件。
+            await asyncio.to_thread(media_executor.shutdown, wait=True)
+            try:
+                await asyncio.to_thread(media_storage.purge_orphans)
+                jobs.clear()
+            finally:
+                media_storage.close()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -2473,7 +2573,7 @@ async def submit_media(kind, file, conf, engine, profile, output):
     with jobs_lock:
         if sum(j['status'] not in ('done', 'error', 'cancelled') for j in jobs.values()) >= 32:
             raise HTTPException(429, '上传处理队列已满，请稍后再试')
-        directory = Path(tempfile.mkdtemp(prefix='yolo-media-'))
+        directory = media_storage.new_directory()
         source = directory / 'source'
         result = directory / ('result.jpg' if kind == 'image' else 'result.mp4')
         jobs[job_id] = dict(status='uploading', stage='uploading', kind=kind, family_id=job_id,
@@ -2571,7 +2671,7 @@ async def retry_media_job(job_id: str, options: dict | None = Body(default=None)
         # 新页面传递本次条件；未带请求体的旧客户端保持原来的重试行为。
         options = validate_media_options(dict(previous['options']) if options is None else options)
         new_id = uuid.uuid4().hex
-        directory = Path(tempfile.mkdtemp(prefix='yolo-media-'))
+        directory = media_storage.new_directory()
         source = directory / 'source'
         kind = previous['kind']
         result = directory / ('result.jpg' if kind == 'image' else 'result.mp4')
@@ -2611,19 +2711,35 @@ async def delete_media_job(job_id: str):
             if future is not None and future.cancel():
                 job.update(status='cancelled', stage='cancelled', finished_at=time.time())
     # 仍在读写的任务由后台清理循环在结束后删除，不破坏正在使用的文件。
-    cleanup_jobs()
+    await asyncio.to_thread(cleanup_jobs)
     return dict(status='deleting')
 
 
 def release_result(job_id):
+    # 只更新计数，适用于响应取消时的 finally；磁盘清理由定时线程负责。
     with jobs_lock:
         if job_id in jobs:
             jobs[job_id]['readers'] -= 1
             jobs[job_id]['updated'] = time.time()
-    cleanup_jobs()
 
 
-# 增加结果读取计数，响应结束后由后台回调释放，防止下载期间被过期清理。
+class JobFileResponse(FileResponse):
+    """在成功、非法 Range、断开或发送异常时都释放结果读取计数。"""
+
+    def __init__(self, path, *, job_id, **kwargs):
+        super().__init__(path, **kwargs)
+        self.job_id = job_id
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # 普通 BackgroundTask 在提前返回/发送异常时不保证执行。
+            # 此处没有 await，响应取消也不会打断计数释放。
+            release_result(self.job_id)
+
+
+# 计数涵盖整个文件响应，包括视频 Range 请求；下载不会延长 finished_at 的保留期限。
 @app.get('/api/jobs/{job_id}/result')
 async def job_result(job_id: str):
     with jobs_lock:
@@ -2637,8 +2753,8 @@ async def job_result(job_id: str):
         job['readers'] += 1
         job['updated'] = time.time()
         result, kind = job['result'], job['kind']
-    return FileResponse(result, media_type='image/jpeg' if kind == 'image' else 'video/mp4',
-                        background=BackgroundTask(release_result, job_id))
+    return JobFileResponse(result, job_id=job_id,
+                           media_type='image/jpeg' if kind == 'image' else 'video/mp4')
 
 
 def process_live_frame(raw, config):

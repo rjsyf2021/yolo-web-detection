@@ -22,12 +22,12 @@ DEFAULT_IMAGE = BASE / 'bus.jpg'
 SOURCE_SIZES = ('1280x720', '1920x1080', '960x720', '1440x1080')
 
 
-# 按 ALIGN 向上对齐，得到引擎实际网络输入尺寸。
+# 按 ALIGN 对齐文件名中的标称尺寸；实际绑定形状仍由 TensorRT 加载时验证。
 def aligned(value):
     return (value + ALIGN - 1) // ALIGN * ALIGN
 
 
-# 扫描目录中的引擎文件；型号与分辨率都从文件名读出，不写死任何档位。
+# 只接受 YOLO26 n/s/m/l/x 的 640×640 引擎，与应用的发现规则一致。
 def discover(directory, variants=None):
     found = []
     for path in sorted(Path(directory).glob('*.engine')):
@@ -78,6 +78,11 @@ def load_source(path):
 
 
 def source_frame(source, size):
+    """构造指定源画幅，耗时不计入测速；之后模型仍会进行 640×640 预处理。
+
+    此处的黑边属于测试素材布局，与模型输入的灰边 LetterBox 是两个阶段。
+    改变源画幅用于对照预处理/画框成本，不能用来评估模型准确率。
+    """
     import cv2
     import numpy as np
     if size is None:
@@ -120,7 +125,7 @@ def measure(model, image, imgsz, conf, device, warmup, rounds, seconds, cap, ren
     return times, speeds
 
 
-# 汇总耗时样本：端到端 FPS 用均值与中位各给一份，阶段耗时取多轮平均。
+# 汇总预测/可选画框耗时；FPS 是耗时倒数，不代表摄像头到浏览器的端到端帧率。
 def summarize(times, speeds):
     ordered = sorted(times)
     mean = statistics.fmean(times)
