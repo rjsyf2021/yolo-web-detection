@@ -950,7 +950,15 @@ def install_webrtc(app, get_pool):
         if decoder not in ('auto', 'nvdec', 'cpu'):
             raise ValueError('无效解码器选择')
         bitrate = max(500000, min(50000000, int(value.get('bitrate', 8000000))))
-        fps = int(value.get('fps', 60))
+        raw_fps = value.get('fps', 60)
+        try:
+            if isinstance(raw_fps, bool) or not isinstance(raw_fps, (str, int, float)):
+                raise ValueError('无效帧率')
+            fps = int(raw_fps)
+            if isinstance(raw_fps, float) and raw_fps != fps:
+                raise ValueError('无效帧率')
+        except (ValueError, TypeError, OverflowError) as exc:
+            raise ValueError('无效帧率') from exc
         if fps not in (10, 15, 20, 24, 25, 30, 40, 45, 50, 60):
             raise ValueError('无效帧率')
         return dict(fps=fps, engine=engine, conf=conf, revision=int(value.get('revision', 0)),
@@ -1865,7 +1873,7 @@ function receiveLiveResult(event,generation){
  const ms=value=>Number.isFinite(value)?value.toFixed(1)+'ms':'—';
  const roundtrip=Number.isFinite(data.sent_at)?now-data.sent_at:NaN;
  const transport=Number.isFinite(data.server_total_ms)?Math.max(0,roundtrip-data.server_total_ms):NaN;
- message('liveStatus',`${liveGeometry?.aspectLabel||$('liveAspect').value} · ${data.width}×${data.height} · JPEG ${Number.isFinite(data.jpeg_quality)?Math.round(data.jpeg_quality*100):'—'}% · ${Math.round(data.jpeg_bytes/1024)} KB\n截图 ${ms(data.draw_ms)} · JPEG 编码 ${ms(data.encode_ms)} · 截图→结果 ${ms(age)}\n发送→结果 ${ms(roundtrip)} · 传输与客户端调度估计 ${ms(transport)} · 发送前积压 ${Math.round((data.buffered_bytes||0)/1024)} KB\n服务器总耗时 ${ms(data.server_total_ms)}（排队 ${ms(data.queue_ms)} + 处理 ${ms(data.server_process_ms)}）\n${data.engine} · 解码/预处理 ${ms(data.decode_ms)} (${data.decoder||'CPU'}) · GPU 锁等待 ${ms(data.wait_ms)} · 预测调用 ${ms(data.infer_ms)}\n${(received/Math.max(elapsed,.01)).toFixed(1)} 检测 FPS · ${data.queue_policy==='latest'?`低延迟（已丢弃 ${data.replaced??0} 帧）`:'顺序处理'} · 当前待处理 ${data.pending_frames??0}/${data.queue_capacity??4} 帧`);
+ message('liveStatus',`${liveGeometry?.aspectLabel||$('liveAspect').value} · ${data.width}×${data.height} · JPEG ${Number.isFinite(data.jpeg_quality)?Math.round(data.jpeg_quality*100):'—'}% · ${Math.round(data.jpeg_bytes/1024)} KB\n截图 ${ms(data.draw_ms)} · JPEG 编码 ${ms(data.encode_ms)} · 截图→结果 ${ms(age)}\n发送→结果 ${ms(roundtrip)} · 传输与客户端调度估计 ${ms(transport)} · 发送前积压 ${Math.round((data.buffered_bytes||0)/1024)} KB\n服务器总耗时 ${ms(data.server_total_ms)}（排队 ${ms(data.queue_ms)} + 处理 ${ms(data.server_process_ms)} + 待发送 ${ms(data.send_queue_ms)}）\n${data.engine} · 解码/预处理 ${ms(data.decode_ms)} (${data.decoder||'CPU'}) · GPU 锁等待 ${ms(data.wait_ms)} · 预测调用 ${ms(data.infer_ms)}\n${(received/Math.max(elapsed,.01)).toFixed(1)} 检测 FPS · ${data.queue_policy==='latest'?`低延迟（已丢弃待处理帧 ${data.replaced??0} · 待发送结果 ${data.replaced_results??0}）`:'顺序处理'} · 当前待处理 ${data.pending_frames??0}/${data.queue_capacity??4} 帧`);
  const settings=cameraStream?.getVideoTracks()[0]?.getSettings();
  if(data.render==='server')$('liveStatus').textContent+=`\n服务器画框 ${ms(data.server_draw_ms)} · 回传 JPEG 编码 ${ms(data.server_encode_ms)} · 回传 ${Math.round(data.return_bytes/1024)} KB · 同帧标注`;
  $('liveStatus').textContent+=`\n实际发送 ${(liveSentCount/Math.max(elapsed,.01)).toFixed(1)} FPS · 摄像头协商 ${settings?.frameRate?.toFixed(1)??'—'} FPS（非实测采集率）\n${encoderLabel} · 缓冲阈值 ${Math.round(bufferLimit()/1024)} KB\n${cameraRequestLabel} · 视频帧 ${$('cameraVideo').videoWidth}×${$('cameraVideo').videoHeight}`;
@@ -2358,6 +2366,9 @@ import uvicorn
 BASE = Path(__file__).resolve().parent
 ENGINE_DIR = Path(os.environ.get('ENGINE_DIR', BASE))
 JOB_RETENTION_SECONDS = 15 * 60
+JOB_CLEANUP_MAX_FAILURES = 5
+WS_SEND_TIMEOUT_SECONDS = 10
+WS_CLOSE_TIMEOUT_SECONDS = 3
 
 
 class MediaStorage:
@@ -2425,17 +2436,19 @@ jobs = {}
 jobs_lock = threading.Lock()
 media_executor = ThreadPoolExecutor(max_workers=max(1, min(4, int(os.environ.get('MEDIA_WORKERS', '4')))), thread_name_prefix='media')
 pool = None
-live_pipeline = None
 
 
 # 从结束时刻起保留 15 分钟，下载不续期；显式删除在处理/读取结束后执行。
 def cleanup_jobs():
     with jobs_lock:
+        now = time.time()
         expired = [job_id for job_id, job in jobs.items()
                    if job['status'] in ('done', 'error', 'cancelled') and not job.get('readers', 0)
+                   and not job.get('cleanup_abandoned')
+                   and now >= job.get('cleanup_retry_at', 0)
                    and (job.get('future') is None or job['future'].done())
                    and (job.get('delete_requested')
-                        or time.time() - job.get('finished_at', job['updated']) >= JOB_RETENTION_SECONDS)]
+                        or now - job.get('finished_at', job['updated']) >= JOB_RETENTION_SECONDS)]
         for job_id in expired:
             job = jobs[job_id]
             # 终态可能先于工作线程收尾，必须等 Future 完成后再删目录和记录。
@@ -2445,8 +2458,19 @@ def cleanup_jobs():
             except FileNotFoundError:
                 pass
             except OSError as exc:
-                # 删除失败时保留记录，下次清理重试，避免宣称删除却遗留文件。
-                print(f'[media/cleanup] {job_id}: 清理失败，稍后重试: {exc}', flush=True)
+                # 有限退避重试；放弃自动清理后仍保留记录和错误，避免遗留文件失去追踪。
+                failures = job.get('cleanup_failures', 0) + 1
+                job.update(cleanup_failures=failures, cleanup_error=str(exc),
+                           cleanup_abandoned=failures >= JOB_CLEANUP_MAX_FAILURES)
+                if job['cleanup_abandoned']:
+                    job.pop('cleanup_retry_at', None)
+                    action = '已停止自动重试，需人工清理或重启后清理'
+                else:
+                    delay = min(300, 10 * 2 ** (failures - 1))
+                    job['cleanup_retry_at'] = time.time() + delay
+                    action = f'{delay} 秒后重试'
+                print(f'[media/cleanup] {job_id}: 清理失败 {failures}/{JOB_CLEANUP_MAX_FAILURES}，'
+                      f'{action}: {exc}', flush=True)
                 continue
             jobs.pop(job_id, None)
 
@@ -2454,7 +2478,7 @@ def cleanup_jobs():
 # 服务接收请求前初始化并预热引擎；关闭时回收会话、工作线程及临时文件。
 @asynccontextmanager
 async def lifespan(app):
-    global pool, live_pipeline
+    global pool
     async def housekeeping():
         while True:
             await asyncio.sleep(10)
@@ -2469,7 +2493,6 @@ async def lifespan(app):
         pool = await asyncio.to_thread(EnginePool, ENGINE_DIR,
                                        int(os.environ.get('ENGINE_CACHE_SIZE', '3')))
         await asyncio.to_thread(pool.warm_all, runs=5, keep_all='ENGINE_CACHE_SIZE' not in os.environ)
-        live_pipeline = RealtimePipeline(pool)
         task = asyncio.create_task(housekeeping())
         yield
     finally:
@@ -2759,20 +2782,17 @@ async def job_result(job_id: str):
                            media_type='image/jpeg' if kind == 'image' else 'video/mp4')
 
 
-def process_live_frame(raw, config):
-    return live_pipeline.process(raw, config)
-
-
 # 接收与推理解耦；每帧携带独立配置快照，连接结束时取消任务并释放排队帧。
 @app.websocket('/ws')
 async def realtime(websocket: WebSocket):
     await websocket.accept()
-    await websocket.send_json(dict(type='init'))
     # fifo：按入队顺序处理已接收帧；推理跟不上输入时，有界队列通过等待入队传递背压。
     # latest：丢弃尚未处理的旧帧，只保留最新画面以降低端到端延迟。
     # 浏览器采集与显示端仍可能跳过画面。
     pending_frames = asyncio.Queue(maxsize=4)
+    pending_results = asyncio.Queue(maxsize=4)
     replaced = 0
+    replaced_results = 0
     # 每连接固定工作线程及解码器，避免默认线程池切换和多连接争用同一解码锁。
     jpeg_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='jpeg-process')
     pipeline = RealtimePipeline(pool)
@@ -2815,6 +2835,7 @@ async def realtime(websocket: WebSocket):
                     await pending_frames.put((raw, current, time.perf_counter()))
 
     async def infer_fifo():
+        nonlocal replaced_results
         while True:
             raw, config, arrived = await pending_frames.get()
             started = time.perf_counter()
@@ -2824,6 +2845,7 @@ async def realtime(websocket: WebSocket):
                 result = dict(type='result', id=config['id'], error=str(exc))
             completed = time.perf_counter()
             result.update(revision=config['revision'], captured_at=config.get('captured_at'),
+                          _result_ready_at=completed,
                           sent_at=config.get('sent_at'), draw_ms=config.get('draw_ms'),
                           encode_ms=config.get('encode_ms'), jpeg_quality=config.get('jpeg_quality'),
                           buffered_bytes=config.get('buffered_bytes'),
@@ -2833,36 +2855,67 @@ async def realtime(websocket: WebSocket):
                           server_process_ms=round((completed - started) * 1000, 2),
                           server_total_ms=round((completed - arrived) * 1000, 2),
                           queue_ms=round((started - arrived) * 1000, 2))
-            # 仅由此任务发送推理结果，保证 WebSocket 写入顺序。
+            if config['policy'] == 'latest':
+                # 仅覆盖尚未发送的低延迟结果；切换策略后仍保留已承诺的 FIFO 结果。
+                retained = []
+                while not pending_results.empty():
+                    old = pending_results.get_nowait()
+                    if old['queue_policy'] == 'fifo':
+                        retained.append(old)
+                    else:
+                        replaced_results += 1
+                for old in retained:
+                    pending_results.put_nowait(old)
+            # FIFO 满时传递背压；sender 的超时负责终止长期不读取的连接。
+            await pending_results.put(result)
+
+    async def send_results():
+        # 所有应用消息由此任务发送，保证初始化、元数据和 JPEG 的顺序。
+        await asyncio.wait_for(websocket.send_json(dict(type='init')), WS_SEND_TIMEOUT_SECONDS)
+        while True:
+            result = await pending_results.get()
+            send_queue_ms = (time.perf_counter() - result.pop('_result_ready_at')) * 1000
+            result.update(replaced_results=replaced_results, pending_results=pending_results.qsize(),
+                          send_queue_ms=round(send_queue_ms, 2),
+                          server_total_ms=round(result['server_total_ms'] + send_queue_ms, 2))
             jpeg = result.pop('_jpeg', None)
             if jpeg is None:
-                await websocket.send_json(result)
+                await asyncio.wait_for(websocket.send_json(result), WS_SEND_TIMEOUT_SECONDS)
             else:
                 # 使用一条完整消息：4 字节大端元数据长度、UTF-8 元数据，
                 # 最后是 JPEG 数据，确保图像与本帧检测结果对应。
                 header = json.dumps(result, ensure_ascii=False).encode('utf-8')
-                await websocket.send_bytes(len(header).to_bytes(4, 'big') + header + jpeg)
+                await asyncio.wait_for(
+                    websocket.send_bytes(len(header).to_bytes(4, 'big') + header + jpeg),
+                    WS_SEND_TIMEOUT_SECONDS)
 
-    tasks = [asyncio.create_task(receive_frames()), asyncio.create_task(infer_fifo())]
+    tasks = [asyncio.create_task(receive_frames()), asyncio.create_task(infer_fifo()),
+             asyncio.create_task(send_results())]
     try:
         finished, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in finished:
             task.result()
     except (WebSocketDisconnect, RuntimeError):
         pass
+    except asyncio.TimeoutError:
+        print('[realtime] 发送超时，关闭慢连接', flush=True)
     except Exception as exc:
         print(f'[realtime] 会话结束: {exc}', flush=True)
     finally:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        await asyncio.to_thread(jpeg_executor.shutdown, wait=True, cancel_futures=True)
         while not pending_frames.empty():
             pending_frames.get_nowait()
+        while not pending_results.empty():
+            pending_results.get_nowait()
         try:
-            await websocket.close()
-        except (RuntimeError, WebSocketDisconnect):
+            await asyncio.wait_for(websocket.close(), WS_CLOSE_TIMEOUT_SECONDS)
+        except (asyncio.TimeoutError, RuntimeError, WebSocketDisconnect):
             pass
+        finally:
+            # 先关闭传输，再等已开始的 GPU 调用收尾，避免慢推理延迟断开慢连接。
+            await asyncio.to_thread(jpeg_executor.shutdown, wait=True, cancel_futures=True)
 
 
 if __name__ == '__main__':

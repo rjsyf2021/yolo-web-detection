@@ -5,6 +5,11 @@ venv/
 yolo_env/
 .env
 .env.*
+# 本机工具配置、云凭据与 SSH 密钥目录
+/.agents/
+/.codex/
+/.aws/
+/.ssh/
 *.engine
 *.pt
 *.onnx
@@ -23,6 +28,7 @@ benchmark_samples/
 mediamtx.yml
 mediamtx
 mediamtx.exe
+/.mediamtx-*/
 .DS_Store
 Thumbs.db
 
