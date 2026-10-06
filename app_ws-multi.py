@@ -623,11 +623,13 @@ def process_video(source, target, pool, options, progress):
     duration_seconds = float(last_end * time_base)
     if has_audio:
         progress(stage='muxing', frames=count)
-        # 视频已将首帧时间戳归零；音频应用同样偏移以保持同步。
-        command = [ffmpeg, '-hide_banner', '-loglevel', 'error', '-y',
+        # 视频已将首帧时间戳归零；保留源音频时间戳后应用同样偏移。
+        # 否则 ffmpeg 默认还会扣除输入起点，造成重复偏移、音画错位或音轨丢失。
+        # 先裁掉零点前的音频，避免 -t 从负时间开始计时而截短尾部；不重置音频延迟。
+        command = [ffmpeg, '-hide_banner', '-loglevel', 'error', '-y', '-copyts',
                    '-i', intermediate, '-itsoffset', str(-float(origin)), '-i', str(source),
                    '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy',
-                   '-c:a', 'aac', '-b:a', '192k', '-t', str(duration_seconds),
+                   '-af', 'atrim=start=0', '-c:a', 'aac', '-b:a', '192k', '-t', str(duration_seconds),
                    '-map_metadata', '-1', '-movflags', '+faststart', str(target)]
         with subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                               text=True, encoding='utf-8', errors='replace') as muxer:

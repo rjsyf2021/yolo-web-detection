@@ -30,6 +30,8 @@ python export_all_engines.py --models m --overwrite
 
 没有指定 `--models` 时，只导出本地已存在权重的型号；例如只有 yolo26s.pt，只导出 yolo26s_640x640.engine。没有权重时，`--list` 展示全部支持档位；实际导出则提示自备权重并退出。指定型号的权重缺失且仍有待构建档位时，会在 GPU 环境检查之前报错。`--check-env` 可独立运行，不要求权重。
 
+仅非空普通文件可作为已有引擎跳过；这项检查不验证 TensorRT 兼容性。空文件会报错，使用 `--overwrite` 可重新构建；目录等非普通文件须先处理路径，即使指定 `--overwrite` 也会报错。`--list` 会标明无效目标。环境检查不扫描导出目标，也不输出模型跳过提示。
+
 可用 `--workspace 4` 将 TensorRT 构建工作区上限设为 4 GiB；这不是整个导出进程的显存或系统内存上限。省略时由 TensorRT 自动决定。
 
 公开参数为 `--models`、`--size`、`--list`、`--check-env`、`--overwrite`、`--workspace` 和帮助参数。`--size 640` 或 `--size 640x640` 指定导出尺寸。当前不提供自选权重路径、输出目录或 GPU 编号的命令行参数。应用可用 `ENGINE_DIR` 指向另一个已有引擎目录，该变量不改变导出工具的输出位置。

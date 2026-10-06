@@ -201,10 +201,27 @@ def export_stage(stage, directory, height, width, workspace, variant="s"):
                     shape=(1, 3, input_h, input_w), metadata=metadata or None, prefix="[TensorRT] ")
 
 
+def engine_file_state(path):
+    """只检查文件类型与大小，不代表引擎已通过 TensorRT 兼容性验证。"""
+    if path.is_file():
+        return 'ready' if path.stat().st_size > 0 else 'empty'
+    return 'invalid' if path.exists() or path.is_symlink() else 'missing'
+
+
+def should_skip_engine(path, overwrite=False):
+    """父进程与 worker 共用检查；无效目标不能作为成功的跳过项。"""
+    state = engine_file_state(path)
+    if state == 'invalid':
+        raise ValueError(f'引擎目标不是普通文件：{path}；请先处理该路径')
+    if state == 'empty' and not overwrite:
+        raise ValueError(f'已有引擎为空文件：{path}；请使用 --overwrite 重新导出')
+    return state == 'ready' and not overwrite
+
+
 def export_one(height, width, overwrite=False, workspace=None, temp_parent=None, variant="s"):
     """三个串行子进程分别导出、参考分析、构建；全部成功才替换目标。"""
     target = BASE / f"yolo26{variant}_{width}x{height}.engine"
-    if target.exists() and not overwrite:
+    if should_skip_engine(target, overwrite):
         print(f"[跳过] 已存在：{target.name}；需要重新导出时使用 --overwrite", flush=True)
         return target
     weights = BASE / f"yolo26{variant}.pt"
@@ -269,6 +286,13 @@ def main():
             export_one(height, width, overwrite=args.overwrite, workspace=args.workspace,
                        temp_parent=args.worker_dir, variant=variant)
         return
+    if args.check_env:
+        # 环境检查不参与导出计划，也不扫描模型或打印跳过信息。
+        try:
+            check_environment()
+        except Exception as exc:
+            raise SystemExit(f"[环境检查失败] {exc}") from exc
+        return
     try:
         size_w, size_h = parse_size(args.size)
     except ValueError as exc:
@@ -282,41 +306,41 @@ def main():
         for variant in variants or MODEL_VARIANTS:
             weights_state = "权重就绪" if (BASE / f"yolo26{variant}.pt").is_file() else "需自备权重"
             name = f"yolo26{variant}_{size_w}x{size_h}.engine"
-            state = "已存在" if (BASE / name).exists() else "待导出"
+            state = {'ready': '已存在', 'missing': '待导出',
+                     'empty': '无效：空文件，需 --overwrite',
+                     'invalid': '无效：目标不是普通文件'}[engine_file_state(BASE / name)]
             print(f"{name}：标称 {size_w}×{size_h}，输入 {input_w}×{input_h} · {state} · {weights_state}")
         return
     pending = []
     skipped = 0
     for variant in variants:
         name = f"yolo26{variant}_{size_w}x{size_h}.engine"
-        if (BASE / name).exists() and not args.overwrite:
+        try:
+            skip = should_skip_engine(BASE / name, args.overwrite)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if skip:
             print(f"[跳过] 已存在：{name}；需要重新导出时使用 --overwrite", flush=True)
             skipped += 1
             continue
         pending.append(variant)
-    if variants and not args.check_env and not pending:
+    if variants and not pending:
         print(f"完成：{len(variants)} 个型号（{size_w}×{size_h}），跳过已存在 {skipped} 个。")
         return
-    if not args.check_env:
-        if not variants:
-            parser.error("未找到本地检测权重；请将自备的 yolo26n/s/m/l/x.pt 放在脚本目录，"
-                         "也可用 --models 指定要导出的型号。脚本不会自动下载")
-        # 先检查所有需要构建的型号，避免跑完部分型号后才发现缺少权重。
-        missing = [f"yolo26{variant}.pt" for variant in pending
-                   if not (BASE / f"yolo26{variant}.pt").is_file()]
-        if missing:
-            parser.error("缺少自备权重：" + "、".join(missing))
+    if not variants:
+        parser.error("未找到本地检测权重；请将自备的 yolo26n/s/m/l/x.pt 放在脚本目录，"
+                     "也可用 --models 指定要导出的型号。脚本不会自动下载")
+    # 先检查所有需要构建的型号，避免跑完部分型号后才发现缺少权重。
+    missing = [f"yolo26{variant}.pt" for variant in pending
+               if not (BASE / f"yolo26{variant}.pt").is_file()]
+    if missing:
+        parser.error("缺少自备权重：" + "、".join(missing))
 
     try:
-        if args.check_env:
-            check_environment()
-        else:
-            # 预检查也在独立进程，避免父进程在整个导出期间占用 CUDA 上下文。
-            subprocess.run([sys.executable, str(Path(__file__).resolve()), "--check-env"], check=True)
+        # 预检查也在独立进程，避免父进程在整个导出期间占用 CUDA 上下文。
+        subprocess.run([sys.executable, str(Path(__file__).resolve()), "--check-env"], check=True)
     except Exception as exc:
         raise SystemExit(f"[环境检查失败] {exc}") from exc
-    if args.check_env:
-        return
     failed = []
     for variant in pending:
         name = f"yolo26{variant}_{size_w}x{size_h}.engine"

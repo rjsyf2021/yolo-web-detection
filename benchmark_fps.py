@@ -229,45 +229,74 @@ def main():
     print(f"\n设备：{report['gpu']} · 预热 {args.warmup} · "
           f"最少 {args.rounds} 轮 / {args.seconds}s · 上限 {args.max_rounds} 轮\n", flush=True)
 
+    gpu_error = None
     for index, item in enumerate(targets, 1):
         model = None
-        try:
-            model = YOLO(str(item['path']), task='detect')
-            for size in args.source_sizes:
+        for size in args.source_sizes:
+            width, height = size if size is not None else (source.shape[1], source.shape[0])
+            identity = dict(key=item['key'], variant=item['variant'], source_w=width,
+                            source_h=height, input_w=640, input_h=640, render=args.render)
+            if gpu_error is not None:
+                report['results'].append(dict(identity, status='skipped',
+                                              error='GPU 清理/同步失败，跳过后续测试：' + gpu_error))
+                print(f"    [跳过] {item['key']} · 源 {width}×{height}: {gpu_error}", flush=True)
+                continue
+            image = None
+            failed_row = None
+            try:
+                if model is None:
+                    model = YOLO(str(item['path']), task='detect')
                 image = source_frame(source, size)
-                height, width = image.shape[:2]
                 print(f"[{index}/{len(targets)}] {item['key']} · 源 {width}×{height} · 推理 640×640", flush=True)
                 torch.cuda.reset_peak_memory_stats(args.device)
                 times, speeds = measure(model, image, (640, 640), args.conf, args.device,
                                         args.warmup, args.rounds, args.seconds, args.max_rounds, args.render)
                 stats = summarize(times, speeds)
-                stats.update(key=item['key'], variant=item['variant'], source_w=width, source_h=height,
-                             input_w=640, input_h=640, render=args.render,
+                stats.update(identity, status='ok',
                              vram_peak_mb=round(torch.cuda.max_memory_allocated(args.device) / 1048576, 1))
                 report['results'].append(stats)
                 drawing = f" · 画框 {stats['drawing_ms']:.2f} ms" if args.render == 'server' else ''
                 print(f"    {stats['rounds']} 轮 · {stats['mean_ms']:.2f} ms · {stats['fps_mean']:.1f} FPS · "
                       f"预处理 {stats['preprocess_ms']:.2f} / 推理 {stats['inference_ms']:.2f} / "
                       f"后处理 {stats['postprocess_ms']:.2f} ms{drawing}", flush=True)
-        except Exception as exc:
-            report['results'].append(dict(key=item['key'], variant=item['variant'], error=str(exc)))
-            print(f"    [失败] {exc}", flush=True)
-        finally:
-            del model
-            gc.collect()
-            torch.cuda.empty_cache()
+            except Exception as exc:
+                failed_row = dict(identity, status='error', error=str(exc))
+                report['results'].append(failed_row)
+                print(f"    [失败] {item['key']} · 源 {width}×{height}: {exc}", flush=True)
+            # 离开 except 后释放回溯和失败预测器；下一尺寸重建模型，避免复用半初始化状态。
+            image = None
+            if failed_row is not None:
+                model = None
+                gc.collect()
+                try:
+                    # 检查异步 CUDA 错误；若上下文不可继续使用，不再尝试其他尺寸或型号。
+                    torch.cuda.synchronize(args.device)
+                    torch.cuda.empty_cache()
+                except Exception as exc:
+                    gpu_error = str(exc)
+                    failed_row['gpu_error'] = gpu_error
+        model = None
+        gc.collect()
+        if gpu_error is None:
+            try:
+                torch.cuda.empty_cache()
+            except Exception as exc:
+                gpu_error = str(exc)
+                report.setdefault('cleanup_errors', []).append(dict(key=item['key'], error=gpu_error))
+                print(f"    [清理失败] {item['key']}: {gpu_error}", flush=True)
 
     ok = [item for item in report['results'] if 'error' not in item]
     if ok:
         print_table(ok)
     failed = [item for item in report['results'] if 'error' in item]
     if failed:
-        print('\n失败档位：' + '、'.join(item['key'] for item in failed))
+        print('\n失败/跳过档位：' + '、'.join(
+            f"{item['key']} {item['source_w']}×{item['source_h']} ({item['status']})" for item in failed))
     args.json.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
     print(f"\n已保存：{args.json.resolve()}")
     print('说明：FPS 包含预处理与后处理；server 模式还含原分辨率画框。'
           '不代表视频流端到端 FPS；显存统计仅覆盖 PyTorch 分配器。')
-    if failed:
+    if failed or report.get('cleanup_errors'):
         raise SystemExit(1)
 
 
