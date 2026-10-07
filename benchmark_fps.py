@@ -150,17 +150,25 @@ def summarize(times, speeds):
     )
 
 
-# 打印 FPS 排行表；分辨率与输入尺寸同时给出，便于判断是否发生补边。
+# 打印耗时表；分辨率与输入尺寸同时给出，便于判断是否发生补边。
+# 型号按参数量升序（n < s < m < l < x 对应约 2.6 / 10.0 / 21.9 / 26.3 / 59.0 M），
+# 同型号内按源画面像素数升序；不按 FPS 混合排序，以便逐行对照同一画幅的差异。
 def print_table(results):
     width = 104
     print(f"\n{'=' * width}")
-    print('预测/画框 FPS 排行（不含解码、编码与传输）')
+    print('预测/画框耗时 · 型号按参数量升序，源画面按像素数升序（不含解码、编码与传输）')
     print(f"{'=' * width}")
     print(f"{'引擎':<22}{'型号':<4}{'源画面':<10}{'输入':<10}"
           f"{'平均ms':>8}{'预处理ms':>9}{'FPS':>8}{'中位FPS':>8}"
           f"{'推理ms':>8}{'后处理ms':>9}{'显存MB':>8}")
     print('-' * width)
-    for item in sorted(results, key=lambda row: row['fps_mean'], reverse=True):
+    current = None
+    for item in sorted(results, key=lambda row: ('nsmlx'.index(row['variant']),
+                                                 row['source_w'] * row['source_h'],
+                                                 row['source_w'])):
+        if current is not None and item['variant'] != current:
+            print('-' * width)
+        current = item['variant']
         source = f"{item['source_w']}x{item['source_h']}"
         net = f"{item['input_w']}x{item['input_h']}"
         print(f"{item['key']:<22}{item['variant']:<4}{source:<10}{net:<10}"
